@@ -1,0 +1,3896 @@
+<!DOCTYPE html>
+<html lang="sv">
+<!--
+  ╔══════════════════════════════════════════════════════════════════════╗
+  ║  PLOCKFLOW v6.0 — Plocksystem för grossistlager                      ║
+  ╠══════════════════════════════════════════════════════════════════════╣
+  ║  VOKABULÄR                                                           ║
+  ║  article    – unik produkt  { artNr, beskrivning, enhet, total,      ║
+  ║               earliestDate, orderRefs[] }                            ║
+  ║  orderRef   – kundrad per artikel { orderNr, kund, antal, … }       ║
+  ║  kundMap    – kontaktinfo per kund (adress, tel, ref, …)             ║
+  ║  state      – hela appens arbetsminne (articles, checked, komm.)     ║
+  ║  chaufState – chaufförsvyns körordning + markerade stopp             ║
+  ╠══════════════════════════════════════════════════════════════════════╣
+  ║  DATAFLÖDE                                                           ║
+  ║  CSV/PDF → parseCSV()/parsePDFFile() → råa rader[]                  ║
+  ║    → aggregateRows() → articles[]                                    ║
+  ║    → mergeIntoState() → state.articles                               ║
+  ║    → render() → DOM                                                  ║
+  ╠══════════════════════════════════════════════════════════════════════╣
+  ║  SEKTIONER I SCRIPT                                                  ║
+  ║  §1  KONSTANTER & KONFIGURATION                                      ║
+  ║  §2  STATE & STORAGE                                                 ║
+  ║  §3  DATUMHJÄLPARE                                                   ║
+  ║  §4  CSV-PARSER                                                      ║
+  ║  §5  PDF-PARSER (Visma eEkonomi)                                     ║
+  ║  §6  PDF.js LOADER                                                   ║
+  ║  §7  AGGREGERING                                                     ║
+  ║  §8  VALIDERING                                                      ║
+  ║  §9  PLOCKLISTA — RENDERING                                          ║
+  ║  §10 PLOCKLISTA — INTERAKTIONER                                      ║
+  ║  §11 KUNDLISTA & KUNDPANEL                                           ║
+  ║  §12 ORDERPANEL                                                      ║
+  ║  §13 UTSKRIFT                                                        ║
+  ║  §14 IMPORT-FLÖDE                                                    ║
+  ║  §15 CHAUFFÖRSVY                                                     ║
+  ║  §16 SCROLL & TOPBAR                                                 ║
+  ║  §17 INITIALISERING                                                  ║
+  ╚══════════════════════════════════════════════════════════════════════╝
+-->
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes, viewport-fit=cover"/>
+<meta http-equiv="Content-Security-Policy" content="default-src 'self' https://chart.googleapis.com; script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; worker-src blob: https://cdn.jsdelivr.net; img-src 'self' data: https://chart.googleapis.com; connect-src 'self' https://nominatim.openstreetmap.org https://cdn.jsdelivr.net;">
+<title>Plockflow</title>
+<style>
+/* ── VARIABLER ──────────────────────────────────────────────── */
+:root {
+  --bg:        #f2f0eb;
+  --surface:   #ffffff;
+  --border:    #e2ddd6;
+  --border2:   #ccc8be;
+  --text:      #0f0f0f;
+  --muted:     #7a7570;
+  --ok:        #0f5c2a;   --ok-bg:   #edfbf3;
+  --warn:      #874200;   --warn-bg: #fff8ed; --warn-b: #f5b941;
+  --err:       #b91c1c;   --err-bg:  #fef2f2;
+  --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+  --mono: 'SF Mono', 'Fira Mono', 'Roboto Mono', Menlo, Courier, monospace;
+  --bar:      52px;
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bot: env(safe-area-inset-bottom, 0px);
+  --radius:   8px;
+  --shadow:   0 1px 4px rgba(0,0,0,.07), 0 4px 16px rgba(0,0,0,.04);
+}
+
+/* ── RESET ──────────────────────────────────────────────────── */
+*, *::before, *::after {
+  box-sizing: border-box; margin: 0; padding: 0;
+  -webkit-tap-highlight-color: transparent;
+}
+html { font-size: 16px; }
+body { font-family: var(--sans); background: var(--bg); color: var(--text); min-height: 100dvh; }
+
+/* ── TOPBAR ─────────────────────────────────────────────────── */
+#topbar {
+  position: fixed; top: 0; left: 0; right: 0; z-index: 200;
+  background: #0f0f0f; color: #fff;
+  padding-top: var(--safe-top);
+  transform: translateY(0);
+  transition: transform .25s ease;
+  will-change: transform;
+  border-bottom: 1px solid #1f1f1f;
+}
+#topbar.hidden { transform: translateY(calc(-100% - var(--safe-top))); }
+#topbar-inner {
+  height: var(--bar);
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0 12px; gap: 6px;
+}
+#topbar-left  { display: flex; align-items: center; gap: 10px; min-width: 0; overflow: hidden; }
+#topbar-right { display: flex; gap: 4px; flex-shrink: 0; align-items: center; }
+#topbar-title { font-family: var(--mono); font-size: 12px; font-weight: 700; letter-spacing: 0.10em; white-space: nowrap; color: #888; text-transform: uppercase; }
+#topbar-meta  { font-family: var(--mono); font-size: 18px; font-weight: 800; color: #fff; white-space: nowrap; letter-spacing: -0.02em; }
+
+/* ── TOPBAR KNAPPAR ─────────────────────────────────────────── */
+.tbtn {
+  font-family: var(--mono); font-size: 11px; font-weight: 700;
+  border: 1.5px solid rgba(255,255,255,0.18); border-radius: 7px;
+  padding: 0; cursor: pointer; background: rgba(255,255,255,0.06);
+  width: 40px; height: 40px; display: flex; align-items: center; justify-content: center;
+  white-space: nowrap; line-height: 1;
+  transition: background .12s, border-color .12s; flex-shrink: 0;
+}
+.tbtn:active { transform: scale(0.94); }
+.tbtn-w { color: rgba(255,255,255,0.85); }       .tbtn-w:hover { background: rgba(255,255,255,0.15); border-color: rgba(255,255,255,0.4); }
+.tbtn-r { color: #f87171; border-color: rgba(248,113,113,0.3); }  .tbtn-r:hover { background: rgba(248,113,113,0.15); }
+.tbtn-g { color: #4ade80; border-color: rgba(74,222,128,0.3); }   .tbtn-g:hover { background: rgba(74,222,128,0.15); }
+.tbtn-y { color: #fbbf24; border-color: rgba(251,191,36,0.3); }   .tbtn-y:hover { background: rgba(251,191,36,0.15); }
+#btn-wakelock.tbtn-g { background: rgba(74,222,128,0.12); }
+
+.tbtn .tbtn-label { display: none; }
+.tbtn svg { display: block; width: 18px; height: 18px; flex-shrink: 0; }
+
+/* ── PROGRESSBAR ────────────────────────────────────────────── */
+#prog-wrap {
+  position: fixed; top: calc(var(--safe-top) + var(--bar)); left: 0; right: 0; z-index: 199;
+  height: 3px; background: #1f1f1f; transition: top .25s ease;
+}
+#topbar.hidden ~ #prog-wrap { top: 0; }
+#prog-bar { height: 3px; background: #4ade80; width: 0%; transition: width .35s cubic-bezier(.4,0,.2,1); }
+#spacer   { height: calc(var(--safe-top) + var(--bar) + 3px); }
+
+/* ── LAYOUT ─────────────────────────────────────────────────── */
+#main { max-width: 680px; margin: 0 auto; padding: 10px 10px calc(var(--safe-bot) + 48px); }
+
+/* ── IMPORT PANEL ───────────────────────────────────────────── */
+#import-panel {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); overflow: hidden; margin-bottom: 14px;
+  box-shadow: var(--shadow);
+}
+.drop-zone {
+  min-height: 76px; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 4px;
+  background: #f8f6f2; padding: 14px 16px;
+  cursor: pointer; transition: background .15s; border-bottom: 1px solid var(--border);
+}
+.drop-zone.drag { background: #e8f0fb; }
+.drop-zone input[type=file] { display: none; }
+.dz-title { font-size: 13px; font-weight: 700; color: var(--text); letter-spacing: -0.01em; }
+.dz-sub   { font-size: 11px; color: var(--muted); font-family: var(--mono); text-align: center; }
+#pdf-status {
+  padding: 7px 14px; font-family: var(--mono); font-size: 11px;
+  color: var(--muted); background: #f8f6f2; border-top: 1px solid var(--border); display: none;
+}
+#pdf-status.show { display: block; }
+.paste-footer {
+  padding: 8px 12px; display: flex; gap: 6px; align-items: center;
+  border-top: 1px solid var(--border); background: #f5f3ef; flex-wrap: wrap;
+}
+.ibtn {
+  font-family: var(--mono); font-size: 13px; font-weight: 700;
+  border: none; border-radius: 6px; padding: 9px 18px;
+  cursor: pointer; min-height: 38px; transition: opacity .15s, background .15s;
+}
+.ibtn-p { background: #111; color: #fff; }
+.ibtn-p:hover { background: #333; }
+.ibtn-p:disabled { opacity: 0.4; cursor: default; }
+.ibtn-s { background: #f0ede8; color: #555; border: 1.5px solid var(--border2); font-size: 12px; padding: 6px 12px; }
+.ibtn-s:hover { background: #e8e4de; }
+
+/* ── RETURBACK — always greyed out ─────────────────────────── */
+.ibtn-returback {
+  background: #e8e4de !important; color: #b0aa9f !important;
+  border: 1.5px solid #d4cfc8 !important;
+  cursor: not-allowed !important; opacity: 0.65 !important;
+  font-family: var(--mono); font-size: 12px; padding: 6px 12px;
+  border-radius: 6px; min-height: 38px; font-weight: 700;
+}
+
+/* ── MEDDELANDEN ────────────────────────────────────────────── */
+#msg-area { margin-bottom: 10px; }
+.msg {
+  font-family: var(--mono); font-size: 12px;
+  padding: 8px 12px; margin-bottom: 4px;
+  border-radius: 0 6px 6px 0; line-height: 1.4;
+}
+.msg-err  { background: var(--err-bg);  border-left: 3px solid var(--err);   color: var(--err); }
+.msg-warn { background: var(--warn-bg); border-left: 3px solid var(--warn-b); color: var(--warn); }
+.msg-ok   { background: var(--ok-bg);   border-left: 3px solid #4ade80;      color: var(--ok); }
+
+/* ── TOMT TILLSTÅND ─────────────────────────────────────────── */
+#empty-state { text-align: center; padding: 48px 16px; color: var(--muted); font-size: 15px; display: none; }
+#empty-state.show { display: block; }
+
+/* ── PLOCKLISTA — ARTIKELRAD ────────────────────────────────── */
+.art-row {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); margin-bottom: 4px; overflow: hidden;
+  transition: box-shadow .15s;
+  box-shadow: 0 1px 3px rgba(0,0,0,.04);
+}
+/* DONE: no greying — just a slim green bar and tick, keeps full opacity */
+.art-row.done {
+  border-left-color: #22c55e !important;
+  background: #fafffe;
+}
+.art-row.just-done { animation: flashDone .5s ease forwards; }
+@keyframes flashDone {
+  0%   { background: #dcfce7; }
+  70%  { background: #f0fdf8; }
+  100% { background: #fafffe; }
+}
+.art-body {
+  display: flex; align-items: stretch; min-height: 56px; cursor: pointer; user-select: none;
+}
+.art-body:active { background: #f6f4f0; }
+
+/* CHECK zone — big tap target, shows tick when done */
+.art-chk {
+  display: flex; align-items: center; justify-content: center;
+  width: 52px; flex-shrink: 0; border-right: 1px solid var(--border);
+  position: relative;
+}
+.art-chk input[type=checkbox] { display: none; }
+/* Custom checkmark area */
+.art-chk-visual {
+  width: 28px; height: 28px; border-radius: 50%;
+  border: 2px solid #d1cec9;
+  display: flex; align-items: center; justify-content: center;
+  transition: border-color .15s, background .15s;
+  flex-shrink: 0;
+}
+.art-row.done .art-chk-visual {
+  background: #22c55e; border-color: #22c55e;
+}
+.art-chk-tick {
+  display: none;
+  width: 14px; height: 14px;
+}
+.art-row.done .art-chk-tick { display: block; }
+
+.art-info { flex: 1; min-width: 0; padding: 6px 8px; display: flex; flex-direction: column; justify-content: center; }
+.art-meta { display: flex; gap: 5px; flex-wrap: wrap; align-items: center; margin-top: 2px; }
+.art-nr   { font-family: var(--mono); font-size: 10px; color: var(--muted); }
+.art-date-badge {
+  font-family: var(--mono); font-size: 9px; font-weight: 700;
+  background: #eff6ff; color: #2563eb; border-radius: 4px; padding: 1px 5px;
+}
+.art-date-past { background: var(--warn-bg); color: var(--warn); }
+.art-qty { display: flex; flex-direction: column; align-items: flex-end; justify-content: center; padding: 6px 10px 6px 4px; flex-shrink: 0; }
+.art-total { font-family: var(--mono); font-size: 22px; font-weight: 800; line-height: 1; letter-spacing: -0.02em; }
+.art-unit  { font-family: var(--mono); font-size: 10px; color: var(--muted); margin-top: 2px; text-align: right; font-weight: 600; }
+.art-name { font-size: 15px; font-weight: 700; line-height: 1.2; letter-spacing: -0.01em; }
+.art-row.done .art-name { color: #6b7280; }
+.art-row.done .art-total { color: #9ca3af; }
+.art-arr   { align-self: center; color: #ccc; padding-right: 8px; flex-shrink: 0; transition: transform .15s; }
+.art-arr.open { transform: rotate(90deg); }
+.art-arr svg { width: 14px; height: 14px; display: block; }
+
+/* ── PLOCKLISTA — DETALJVY ──────────────────────────────────── */
+.art-detail {
+  max-height: 0; overflow: hidden;
+  transition: max-height .25s ease;
+  border-top: 0 solid var(--border);
+  background: #f7f5f1;
+}
+.art-detail.open { max-height: 900px; border-top-width: 1px; }
+.drow {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  padding: 8px 12px; border-bottom: 1px solid var(--border); gap: 8px;
+}
+.drow:last-child { border-bottom: none; }
+.dkund  { font-size: 13px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dmeta  { display: flex; gap: 5px; margin-top: 3px; flex-wrap: wrap; align-items: center; }
+.dorder { font-family: var(--mono); font-size: 10px; color: var(--muted); }
+.ddate  { font-family: var(--mono); font-size: 10px; color: #2563eb; background: #eff6ff; padding: 1px 5px; border-radius: 4px; font-weight: 600; }
+.ddate.past { color: var(--warn); background: var(--warn-bg); }
+.dantal { font-family: var(--mono); font-size: 15px; font-weight: 800; white-space: nowrap; flex-shrink: 0; margin-top: 1px; letter-spacing: -0.02em; }
+.daddr  { font-size: 12px; color: var(--muted); margin-top: 4px; line-height: 1.4; }
+.daddr a { color: #1d4ed8; text-decoration: none; }
+.daddr a:hover { text-decoration: underline; }
+.daddr-warn { color: var(--warn); font-size: 10px; font-weight: 700; letter-spacing: 0.05em; }
+.dtime { font-family: var(--mono); font-size: 10px; font-weight: 800; background: #f5f3ff; color: #6d28d9; padding: 1px 6px; border-radius: 4px; }
+.addr-link { color: #1d4ed8; text-decoration: none; }
+.addr-link:hover { text-decoration: underline; }
+.dorder-link {
+  font-family: var(--mono); font-size: 11px; color: #2563eb;
+  cursor: pointer; text-decoration: underline dotted; text-underline-offset: 2px;
+  background: none; border: none; padding: 0;
+}
+.dorder-link:hover { color: #1e40af; text-decoration: underline; }
+.dkommentar-btn {
+  font-family: var(--mono); font-size: 10px; color: var(--muted);
+  background: none; border: 1px dashed var(--border2); border-radius: 4px;
+  padding: 2px 7px; cursor: pointer; margin-top: 4px; display: inline-block;
+}
+.dkommentar-btn:hover { border-color: #888; color: #333; }
+.dkommentar-text {
+  font-size: 11px; color: #555; font-style: italic; margin-top: 4px;
+  background: #fefce8; border-radius: 4px; padding: 2px 7px; display: inline-block;
+}
+
+/* ── CATEGORY PICKER POPUP ───────────────────────────────── */
+/* ── KATEGORIER — BOTTOM SHEET ──────────────────────────────── */
+#cat-order-modal {
+  display: none; position: fixed; inset: 0; z-index: 450;
+  background: rgba(0,0,0,0.5);
+  backdrop-filter: blur(2px);
+  align-items: flex-end; justify-content: center;
+}
+#cat-order-modal.open { display: flex; }
+#cat-order-sheet {
+  background: #fff;
+  border-radius: 18px 18px 0 0;
+  width: 100%; max-width: 560px;
+  max-height: 90dvh;
+  display: flex; flex-direction: column;
+  overflow: hidden;
+  box-shadow: 0 -4px 40px rgba(0,0,0,.18);
+  animation: slideUp .22s ease;
+}
+@keyframes slideUp { from { transform: translateY(60px); opacity: 0; } to { transform: none; opacity: 1; } }
+#cat-order-drag-handle {
+  width: 36px; height: 4px; border-radius: 2px;
+  background: #ddd; margin: 10px auto 0; flex-shrink: 0;
+}
+#cat-order-sheet-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 16px 10px; flex-shrink: 0;
+  border-bottom: 1px solid var(--border);
+}
+#cat-order-sheet-title {
+  font-family: var(--mono); font-size: 11px; font-weight: 900;
+  letter-spacing: .12em; color: #111;
+}
+#cat-order-sheet-close {
+  width: 36px; height: 36px; border-radius: 6px;
+  border: 1.5px solid #f87171; color: #f87171;
+  background: none; cursor: pointer; font-size: 16px;
+  display: flex; align-items: center; justify-content: center;
+}
+#cat-order-sheet-body {
+  flex: 1; overflow-y: auto; padding: 14px 14px 0;
+  -webkit-overflow-scrolling: touch;
+}
+.cos-section-label {
+  font-family: var(--mono); font-size: 9px; font-weight: 800;
+  color: var(--muted); letter-spacing: .10em;
+  margin-bottom: 8px;
+}
+/* Article list rows */
+#_cm-artlist {
+  border: 1px solid var(--border); border-radius: 10px;
+  overflow: hidden; margin-bottom: 16px;
+}
+._cm-art-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 12px; border-bottom: 1px solid var(--border);
+  cursor: pointer; transition: background .1s; min-height: 56px;
+  background: #fff;
+}
+._cm-art-row:last-child { border-bottom: none; }
+._cm-art-row:active { background: #f5f3ef; }
+/* Drag order rows */
+#cat-order-list { display: flex; flex-direction: column; gap: 6px; margin-bottom: 6px; }
+.cos-drag-row {
+  display: flex; align-items: center; gap: 12px;
+  padding: 14px 12px;
+  background: #fff; border: 1.5px solid var(--border);
+  border-radius: 10px; cursor: grab; user-select: none; touch-action: none;
+  min-height: 56px; transition: box-shadow .1s;
+}
+.cos-drag-row.dragging { opacity: 0.4; box-shadow: 0 4px 16px rgba(0,0,0,.12); }
+.cos-color-bar { width: 4px; height: 24px; border-radius: 2px; flex-shrink: 0; }
+.cos-drag-label { font-family: var(--mono); font-size: 13px; font-weight: 800; letter-spacing: .04em; flex: 1; }
+/* Sticky footer */
+#cat-order-sheet-footer {
+  display: flex; gap: 8px; padding: 12px 14px;
+  padding-bottom: calc(12px + env(safe-area-inset-bottom, 0px));
+  border-top: 1px solid var(--border); flex-shrink: 0; background: #fff;
+}
+#cat-order-sheet-footer .ibtn { flex: 1; min-height: 50px; font-size: 14px; }
+
+.cat-picker-popup {
+  position: absolute; z-index: 500;
+  background: #fff; border: 1px solid var(--border2);
+  border-radius: 10px; box-shadow: 0 8px 32px rgba(0,0,0,.16);
+  padding: 5px; min-width: 170px;
+  display: none;
+}
+.cat-picker-popup.open { display: block; }
+.cat-picker-opt {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 11px; border-radius: 6px; cursor: pointer;
+  font-family: var(--mono); font-size: 11px; font-weight: 800;
+  letter-spacing: .05em; white-space: nowrap;
+  transition: background .1s;
+}
+.cat-picker-opt:hover { background: var(--bg); }
+.cat-picker-opt.active { background: var(--bg); }
+.cat-picker-dot {
+  width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0;
+}
+
+/* ── KATEGORI-DIVIDER ───────────────────────────────────────── */
+.cat-divider {
+  display: flex; align-items: center; gap: 8px;
+  padding: 5px 0 3px;
+  user-select: none; cursor: pointer;
+}
+.cat-divider-bar {
+  width: 4px; height: 18px; border-radius: 2px; flex-shrink: 0;
+}
+.cat-divider-label {
+  font-family: var(--mono); font-size: 10px; font-weight: 900;
+  letter-spacing: .12em; white-space: nowrap; text-transform: uppercase;
+}
+.cat-divider-line {
+  flex: 1; height: 1px;
+}
+
+/* ── MODALER — gemensam overlay-grund ──────────────────────── */
+.modal-overlay {
+  display: none; position: fixed; inset: 0; z-index: 400;
+  background: rgba(0,0,0,0.55); padding: 16px; overflow-y: auto;
+  backdrop-filter: blur(2px);
+}
+.modal-overlay.open { display: flex; align-items: flex-start; justify-content: center; }
+.modal-box {
+  background: #fff; border-radius: 14px; width: 100%;
+  padding: 18px; margin-top: 8px;
+  box-shadow: 0 20px 60px rgba(0,0,0,.2);
+}
+
+/* ── ORDER-PANEL ────────────────────────────────────────────── */
+#order-panel { z-index: 400; max-width: 600px; }
+.ocard-kundnamn { font-size: 18px; font-weight: 700; margin-bottom: 10px; letter-spacing: -0.01em; }
+.ocard-info { background: #f8f6f2; border-radius: 8px; padding: 10px 12px; margin-bottom: 14px; }
+.oinfo-row  { display: flex; gap: 8px; align-items: baseline; padding: 5px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+.oinfo-row:last-child { border-bottom: none; }
+.oinfo-label  { font-family: var(--mono); font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; min-width: 110px; flex-shrink: 0; padding-top: 2px; }
+.oinfo-warn   { color: var(--warn); font-size: 10px; font-weight: 700; }
+.oinfo-senast { font-weight: 800; background: #f5f3ff; color: #6d28d9; font-family: var(--mono); font-size: 12px; padding: 2px 7px; border-radius: 4px; }
+.oinfo-date   { font-family: var(--mono); font-size: 12px; color: #2563eb; background: #eff6ff; padding: 2px 7px; border-radius: 4px; font-weight: 600; }
+.oinfo-levdate { color: #059669; background: #f0fdf4; }
+.ocard-table  { width: 100%; border-collapse: collapse; font-size: 13px; }
+.ocard-table th { text-align: left; font-family: var(--mono); font-size: 10px; font-weight: 700; letter-spacing: 0.08em; color: var(--muted); text-transform: uppercase; padding: 4px 6px; border-bottom: 2px solid var(--border); }
+.ocard-table td { padding: 7px 6px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.ocard-table tr:last-child td { border-bottom: none; }
+.ocard-table .td-nr  { font-family: var(--mono); font-size: 11px; color: var(--muted); white-space: nowrap; }
+.ocard-table .td-qty { font-family: var(--mono); font-weight: 800; text-align: right; white-space: nowrap; }
+
+/* ── KUNDLISTA & KUNDPANEL ──────────────────────────────────── */
+#kundlista-panel { z-index: 300; max-width: 680px; }
+#kund-panel { z-index: 500; max-width: 560px; }
+.kcard {
+  border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px;
+  margin-bottom: 8px; background: var(--surface); font-size: 13px;
+  break-inside: avoid; cursor: pointer; transition: border-color .15s, box-shadow .15s;
+}
+.kcard:hover { border-color: #aaa; box-shadow: 0 2px 10px rgba(0,0,0,.08); }
+.kcard-name { font-weight: 700; font-size: 15px; margin-bottom: 6px; letter-spacing: -0.01em; }
+.kcard-row  { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; font-size: 12px; color: #333; padding: 3px 0; border-bottom: 1px solid var(--border); }
+.kcard-row:last-child { border-bottom: none; }
+.kcard-label  { font-size: 10px; font-family: var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; min-width: 100px; flex-shrink: 0; }
+.kcard-warn   { color: var(--warn); font-size: 10px; font-weight: 700; }
+.kcard-senast { font-weight: 800; background: #f5f3ff; color: #6d28d9; font-family: var(--mono); font-size: 11px; padding: 1px 6px; border-radius: 4px; }
+.kcard-date   { font-family: var(--mono); font-size: 11px; color: #2563eb; background: #eff6ff; padding: 1px 6px; border-radius: 4px; font-weight: 600; }
+.kcard-levdate { color: #059669; background: #f0fdf4; }
+
+/* ── HAMBURGER SIDOPANEL ────────────────────────────────────── */
+#hamburger-overlay {
+  display: none; position: fixed; inset: 0; z-index: 500;
+  background: rgba(0,0,0,0.5);
+}
+#hamburger-overlay.open { display: block; }
+#hamburger-panel {
+  position: fixed; top: 0; right: 0; bottom: 0; z-index: 501;
+  width: 260px; max-width: 85vw;
+  background: #0f0f0f; padding-top: var(--safe-top);
+  transform: translateX(100%); transition: transform .22s ease;
+  display: flex; flex-direction: column;
+  border-left: 1px solid #1f1f1f;
+}
+#hamburger-panel.open { transform: translateX(0); }
+#hm-header {
+  height: var(--bar); display: flex; align-items: center; justify-content: space-between;
+  padding: 0 14px; border-bottom: 1px solid #1f1f1f;
+}
+#hm-title { font-family: var(--mono); font-size: 11px; font-weight: 800; color: #555; letter-spacing: .12em; }
+#hm-close { background: none; border: none; color: #888; cursor: pointer; padding: 8px; }
+#hm-close svg { display: block; width: 18px; height: 18px; }
+#hm-body { flex: 1; overflow-y: auto; padding: 8px 0; }
+.hm-item {
+  display: flex; align-items: center; gap: 12px;
+  padding: 13px 16px; cursor: pointer;
+  font-size: 14px; font-weight: 600; color: #e0e0e0;
+  border: none; background: none; width: 100%; text-align: left;
+  transition: background .1s;
+}
+.hm-item:hover { background: #1a1a1a; }
+.hm-item:active { background: #222; }
+.hm-item svg { width: 18px; height: 18px; color: #666; flex-shrink: 0; }
+.hm-item.hm-danger { color: #f87171; }
+.hm-item.hm-danger svg { color: #f87171; }
+.hm-sep { height: 1px; background: #1f1f1f; margin: 4px 0; }
+.hm-section { font-family: var(--mono); font-size: 9px; font-weight: 800; color: #444; letter-spacing: .12em; padding: 12px 16px 4px; }
+
+#print-header { display: none; }
+@media print {
+  * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  #topbar, #prog-wrap, #spacer, #import-panel, #msg-area,
+  .art-chk, .art-arr, .art-detail, #empty-state,
+  #kundlista-panel, #order-panel, #kund-panel,
+  #plocklista, #paste-modal, #kommentar-modal, #chauf-panel { display: none !important; }
+  body  { background: white; font-family: Arial, sans-serif; margin: 0; }
+  #main { padding: 0 8px; max-width: 100%; }
+  #print-header { display: block !important; padding-bottom: 5px; border-bottom: 2px solid #111; margin-bottom: 8px; }
+  #print-header h1 { font-size: 14px; font-weight: 700; letter-spacing: 0.06em; display: inline; }
+  #print-header p  { font-size: 9px; color: #555; margin-top: 2px; }
+  #print-kundkort  { display: none !important; }
+  #print-kombinerad { display: block !important; }
+  .print-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; align-items: start; }
+  .print-kundblock { border: 1px solid #aaa; border-radius: 3px; break-inside: avoid; overflow: hidden; font-size: 9px; }
+  .pk-header { background: #f0f0f0; padding: 4px 6px; border-bottom: 1px solid #aaa; }
+  .pk-name   { font-size: 11px; font-weight: 700; line-height: 1.2; }
+  .pk-meta   { font-size: 8px; color: #444; margin-top: 2px; line-height: 1.5; }
+  .pk-meta a { color: #000; text-decoration: none; }
+  .pk-articles { padding: 0; }
+  .pk-art-row  { display: flex; align-items: center; padding: 2px 6px; border-bottom: 1px solid #e8e8e8; gap: 4px; }
+  .pk-art-row:last-child { border-bottom: none; }
+  .pk-art-name { flex: 1; font-size: 9px; font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pk-art-nr   { font-size: 8px; color: #888; white-space: nowrap; min-width: 36px; }
+  .pk-art-qty  { font-weight: 700; font-size: 11px; white-space: nowrap; text-align: right; min-width: 32px; }
+  .pk-art-unit { font-size: 8px; color: #666; min-width: 18px; }
+  .pk-footer   { padding: 3px 6px; border-top: 1px dashed #ccc; font-size: 8px; color: #555; }
+  .pk-kommentar { font-style: italic; }
+  .pk-check    { margin-top: 2px; display: flex; gap: 8px; }
+  .pk-check-item { display: flex; align-items: center; gap: 3px; }
+  .pk-check-box  { width: 9px; height: 9px; border: 1px solid #888; display: inline-block; }
+  .print-plocklista-header { font-size: 11px; font-weight: 700; letter-spacing: 0.06em; margin: 10px 0 5px; border-bottom: 2px solid #111; padding-bottom: 3px; page-break-before: always; }
+  .print-plocklista-grid   { display: grid; grid-template-columns: 1fr 1fr; gap: 3px; }
+  .print-art-row  { border: 1px solid #ccc; border-radius: 2px; break-inside: avoid; display: flex; align-items: center; padding: 2px 5px; gap: 4px; }
+  .print-art-name { flex: 1; font-size: 9px; font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .print-art-nr   { font-size: 8px; color: #888; }
+  .print-art-total { font-weight: 700; font-size: 12px; white-space: nowrap; }
+  .print-art-unit { font-size: 8px; color: #666; }
+}
+
+/* ════════════════════════════════════════════════════════════════
+   CHAUFFÖRSVY v2 — Rengjord, fokuserad körvyn
+   Principer: ≥64px tryckytor · max 1s igenkänning · en hand
+   ════════════════════════════════════════════════════════════════ */
+
+@import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;600;700;800;900&display=swap');
+
+:root {
+  --cd-bg:      #080808;
+  --cd-card:    #111113;
+  --cd-line:    #1e1e22;
+  --cd-handle:  #0c0c0e;
+  --cd-amber:   #f5a623;
+  --cd-green:   #00d26a;
+  --cd-blue:    #4a9eff;
+  --cd-red:     #ff4444;
+  --cd-white:   #f0f0f0;
+  --cd-dim:     #555;
+  --cd-font:    'Barlow Condensed', var(--mono);
+}
+
+/* ── FULLSKÄRM SKAL ──────────────────────────────────────────── */
+#chauf-panel {
+  display: none; position: fixed; inset: 0; z-index: 700;
+  background: var(--cd-bg);
+  overflow-y: auto; overflow-x: hidden;
+  -webkit-overflow-scrolling: touch;
+}
+#chauf-panel.open { display: block; }
+
+/* ── TOPLIST ─────────────────────────────────────────────────── */
+#cd-header {
+  position: sticky; top: 0; z-index: 20;
+  background: var(--cd-bg);
+  border-bottom: 1px solid var(--cd-line);
+  padding: calc(var(--safe-top) + 8px) 10px 8px;
+}
+#cd-progress-track {
+  height: 3px; background: #1a1a1e; border-radius: 2px;
+  margin-bottom: 10px; overflow: hidden;
+}
+#cd-progress-fill {
+  height: 100%; background: var(--cd-amber);
+  border-radius: 2px; transition: width .4s ease; width: 0%;
+}
+#cd-header-row {
+  display: grid; grid-template-columns: 56px 1fr auto auto auto;
+  gap: 6px; align-items: center;
+}
+#cd-back-btn {
+  display: flex; align-items: center; justify-content: center;
+  min-height: 52px; min-width: 52px; background: #1a1a1e;
+  border: none; border-radius: 12px; font-size: 22px;
+  color: var(--cd-white); cursor: pointer; transition: background .1s;
+}
+#cd-back-btn:active { background: #2a2a30; }
+#cd-counter {
+  font-family: var(--cd-font); font-size: 30px; font-weight: 900;
+  line-height: 1; color: var(--cd-white); letter-spacing: -0.01em;
+}
+#cd-counter span { color: var(--cd-dim); font-size: 20px; font-weight: 600; }
+#cd-wakelock-btn, #cd-sort-btn, #cd-header-share-btn {
+  display: flex; align-items: center; justify-content: center;
+  min-height: 52px; min-width: 52px;
+  border: none; border-radius: 12px;
+  cursor: pointer; transition: background .1s;
+  background: #1a1a1e;
+}
+#cd-wakelock-btn { color: var(--cd-dim); }
+#cd-wakelock-btn.active { background: #1a2a1a; color: var(--cd-green); }
+#cd-wakelock-btn:active, #cd-sort-btn:active, #cd-header-share-btn:active { background: #2a2a30; }
+#cd-sort-btn { color: var(--cd-amber); }
+#cd-header-share-btn { color: var(--cd-blue); }
+
+/* ── STOPPLISTA ──────────────────────────────────────────────── */
+#cd-list { padding: 8px 10px calc(var(--safe-bot) + 24px); }
+
+/* ── STOPKORT ────────────────────────────────────────────────── */
+.cd-card {
+  background: var(--cd-card); border-radius: 16px;
+  margin-bottom: 8px; overflow: hidden;
+  border: 1px solid var(--cd-line);
+  transition: opacity .3s, border-color .2s;
+}
+.cd-card.done { opacity: 0.22; border-color: transparent; }
+.cd-card.ghost { opacity: 0.15; pointer-events: none; border-style: dashed; border-color: var(--cd-green); }
+.cd-placeholder {
+  border: 2px dashed var(--cd-green); border-radius: 16px;
+  margin-bottom: 8px; background: rgba(0,210,106,0.04);
+}
+.cd-inner { display: flex; align-items: stretch; }
+
+/* ── SIFFERKOLUMN MED DRAG ───────────────────────────────────── */
+.cd-handle {
+  display: flex; flex-direction: column; align-items: center;
+  justify-content: center; width: 52px; flex-shrink: 0;
+  background: var(--cd-handle); border-right: 1px solid var(--cd-line);
+  cursor: grab; touch-action: none; user-select: none;
+  gap: 4px; padding: 14px 0;
+}
+.cd-handle:active { cursor: grabbing; background: #161618; }
+.cd-stopnr {
+  font-family: var(--cd-font); font-size: 26px; font-weight: 900;
+  line-height: 1; color: var(--cd-amber);
+}
+.cd-drag-dots { display: grid; grid-template-columns: 1fr 1fr; gap: 3px; padding: 2px; }
+.cd-drag-dots span { width: 4px; height: 4px; border-radius: 50%; background: #2a2a2a; display: block; }
+
+/* ── KORTETS INNEHÅLL ────────────────────────────────────────── */
+.cd-body { flex: 1; min-width: 0; padding: 12px 12px 10px; }
+
+/* Kundnamn — PRIMÄRT läsmål */
+.cd-name {
+  font-family: var(--cd-font); font-size: 30px; font-weight: 900;
+  line-height: 1.05; color: var(--cd-white);
+  margin-bottom: 4px; letter-spacing: -0.01em;
+}
+
+/* Tidsbadge + ordernr */
+.cd-meta-row {
+  display: flex; align-items: center; gap: 8px;
+  margin-bottom: 10px; flex-wrap: wrap;
+}
+.cd-senast {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-family: var(--cd-font); font-size: 20px; font-weight: 800;
+  background: rgba(245,166,35,0.15); color: var(--cd-amber);
+  border: 1px solid rgba(245,166,35,0.3);
+  border-radius: 8px; padding: 3px 10px;
+}
+.cd-order-ref {
+  font-family: var(--cd-font); font-size: 14px; font-weight: 600;
+  color: var(--cd-dim);
+}
+
+/* Adressrad */
+.cd-addr {
+  font-family: var(--cd-font); font-size: 19px; font-weight: 600;
+  line-height: 1.3; color: #b0b0b0; margin-bottom: 10px;
+}
+.cd-fak-warn {
+  font-family: var(--cd-font); font-size: 11px; font-weight: 800;
+  color: #f97316; letter-spacing: 0.06em; display: block; margin-bottom: 2px;
+}
+.cd-no-addr {
+  font-family: var(--cd-font); font-size: 16px; font-weight: 600;
+  color: #333; font-style: italic; margin-bottom: 10px;
+}
+
+/* Knappar — 3 i rad: NAVIGERA · RING · AVLASTA */
+.cd-action-row {
+  display: grid; grid-template-columns: 1fr 1fr 1fr;
+  gap: 6px; margin-bottom: 10px;
+}
+.cd-action-row.no-phone { grid-template-columns: 1fr 1fr; }
+.cd-action-row.no-addr  { grid-template-columns: 1fr 1fr; }
+.cd-action-row.only-unload { grid-template-columns: 1fr; }
+
+.cd-btn {
+  display: flex; flex-direction: column; align-items: center;
+  justify-content: center; gap: 3px;
+  min-height: 60px; border-radius: 12px;
+  font-family: var(--cd-font); font-size: 13px; font-weight: 800;
+  text-decoration: none; letter-spacing: 0.04em; cursor: pointer;
+  transition: opacity .1s; border: none;
+}
+.cd-btn:active { opacity: 0.65; }
+.cd-btn svg { flex-shrink: 0; }
+.cd-btn-nav {
+  background: #071f10; color: var(--cd-green);
+  border: 1.5px solid #0f3d20;
+}
+.cd-btn-phone {
+  background: #0a1a0a; color: var(--cd-green);
+  border: 1.5px solid #133513;
+}
+.cd-btn-unload {
+  background: #0d1520; color: var(--cd-blue);
+  border: 1.5px solid #1a3050;
+}
+
+/* Kommentar */
+.cd-comment {
+  display: flex; align-items: flex-start; gap: 8px;
+  background: #1a1600; border: 1px solid #3d3000;
+  border-radius: 10px; padding: 8px 12px;
+  font-family: var(--cd-font); font-size: 17px; font-weight: 600;
+  color: #f5c842; margin-bottom: 10px; line-height: 1.3;
+}
+
+/* Levererad-bekräftelse */
+.cd-levererad {
+  display: none;
+  font-family: var(--cd-font); font-size: 18px; font-weight: 800;
+  color: var(--cd-green); text-align: center;
+  padding: 8px 0; letter-spacing: 0.06em;
+}
+
+/* Klar / ej klar-knapp */
+.cd-done-btn {
+  display: flex; align-items: center; justify-content: center; gap: 10px;
+  width: 100%; min-height: 62px; margin-top: 8px;
+  font-family: var(--cd-font); font-size: 22px; font-weight: 900;
+  letter-spacing: 0.04em;
+  background: #071f10; color: var(--cd-green);
+  border: 2px solid #0f3d20; border-radius: 14px;
+  cursor: pointer; transition: background .1s;
+}
+.cd-done-btn:active { background: #0f3d20; }
+.cd-card.done .cd-done-btn {
+  background: #0e0e10; color: #2a2a2a; border-color: #1a1a1a; font-size: 17px;
+}
+
+/* ── TOM / LADDAR ────────────────────────────────────────────── */
+#cd-empty {
+  display: none; flex-direction: column; align-items: center;
+  justify-content: center; min-height: 60vh; gap: 12px;
+  font-family: var(--cd-font); color: #333; text-align: center;
+}
+#cd-empty.show { display: flex; }
+#cd-empty-icon { font-size: 48px; opacity: 0.3; }
+#cd-empty-text { font-size: 20px; font-weight: 700; color: #444; }
+
+#cd-sorting-overlay {
+  display: none; position: fixed; inset: 0; z-index: 800;
+  background: rgba(8,8,8,0.92); align-items: center; justify-content: center;
+  flex-direction: column; gap: 16px;
+}
+#cd-sorting-overlay.show { display: flex; }
+.cd-spinner {
+  width: 40px; height: 40px;
+  border: 3px solid #222; border-top-color: var(--cd-amber);
+  border-radius: 50%; animation: cd-spin .7s linear infinite;
+}
+@keyframes cd-spin { to { transform: rotate(360deg); } }
+.cd-sort-label {
+  font-family: var(--cd-font); font-size: 18px; font-weight: 700;
+  color: var(--cd-amber); letter-spacing: 0.05em;
+}
+
+/* ════════════════════════════════════════════════════════════════
+   AVLASTNINGSVY — fullskärm vid kund
+   ════════════════════════════════════════════════════════════════ */
+#cd-unload-panel {
+  display: none; position: fixed; inset: 0; z-index: 800;
+  background: #050505; overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+#cd-unload-panel.open { display: block; }
+
+/* Header */
+#cd-ul-header {
+  position: sticky; top: 0; z-index: 10;
+  background: #050505; border-bottom: 1px solid #1a1a1e;
+  padding: calc(var(--safe-top) + 8px) 12px 10px;
+  display: flex; align-items: center; gap: 10px;
+}
+#cd-ul-back {
+  display: flex; align-items: center; justify-content: center;
+  min-height: 52px; min-width: 52px; background: #181818;
+  border: none; border-radius: 12px; font-size: 22px;
+  color: #e0e0e0; cursor: pointer; flex-shrink: 0;
+}
+#cd-ul-back:active { background: #2a2a2a; }
+#cd-ul-title {
+  flex: 1; min-width: 0;
+  font-family: var(--cd-font); font-size: 26px; font-weight: 900;
+  color: #fff; line-height: 1.1; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+}
+#cd-ul-badge {
+  font-family: var(--cd-font); font-size: 13px; font-weight: 800;
+  color: var(--cd-blue); background: rgba(74,158,255,0.12);
+  border: 1px solid rgba(74,158,255,0.25);
+  border-radius: 8px; padding: 4px 10px; flex-shrink: 0;
+  white-space: nowrap;
+}
+
+/* Artikelrader */
+#cd-ul-list {
+  padding: 10px 10px calc(var(--safe-bot) + 24px);
+}
+.cd-ul-item {
+  display: flex; align-items: center;
+  background: #111113; border-radius: 14px;
+  border: 1px solid #1e1e22;
+  margin-bottom: 6px; padding: 14px 16px;
+  gap: 12px; user-select: none; cursor: pointer;
+  transition: opacity .2s, background .15s;
+}
+.cd-ul-item.checked {
+  opacity: 0.28; background: #0a0a0a;
+}
+.cd-ul-item:active { background: #1a1a1e; }
+
+/* Checkbox visual */
+.cd-ul-chk {
+  width: 32px; height: 32px; border-radius: 50%;
+  border: 2.5px solid #2a2a2a; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  transition: border-color .15s, background .15s;
+}
+.cd-ul-item.checked .cd-ul-chk {
+  background: var(--cd-green); border-color: var(--cd-green);
+}
+.cd-ul-chk svg { display: none; }
+.cd-ul-item.checked .cd-ul-chk svg { display: block; }
+
+/* Text */
+.cd-ul-info { flex: 1; min-width: 0; }
+.cd-ul-name {
+  font-family: var(--cd-font); font-size: 22px; font-weight: 700;
+  color: #e0e0e0; line-height: 1.15;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.cd-ul-item.checked .cd-ul-name { color: #333; }
+.cd-ul-nr {
+  font-family: var(--cd-font); font-size: 13px; font-weight: 600;
+  color: #333; margin-top: 2px;
+}
+
+/* Antal — rightmost, huge */
+.cd-ul-qty {
+  font-family: var(--cd-font); font-size: 32px; font-weight: 900;
+  color: var(--cd-white); white-space: nowrap; text-align: right;
+  line-height: 1;
+}
+.cd-ul-item.checked .cd-ul-qty { color: #2a2a2a; }
+.cd-ul-unit {
+  font-family: var(--cd-font); font-size: 14px; font-weight: 600;
+  color: var(--cd-dim); margin-top: 2px; text-align: right;
+}
+
+/* Divider för kategorier */
+.cd-ul-cat-divider {
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 4px 4px; margin-top: 6px;
+}
+.cd-ul-cat-bar { width: 4px; height: 16px; border-radius: 2px; flex-shrink: 0; }
+.cd-ul-cat-label {
+  font-family: var(--cd-font); font-size: 12px; font-weight: 900;
+  letter-spacing: .12em; color: #444;
+}
+.cd-ul-cat-line { flex: 1; height: 1px; background: #1a1a1e; }
+</style>
+</head>
+<body>
+
+<!-- ── TOPBAR ──────────────────────────────────────────────── -->
+<div id="topbar">
+  <div id="topbar-inner">
+    <div id="topbar-left">
+      <span id="topbar-title">PLOCKFLOW</span>
+      <span id="topbar-meta"></span>
+    </div>
+    <div id="topbar-right">
+      <button class="tbtn tbtn-w" id="btn-wakelock" onclick="toggleWakeLock()" title="Håll skärmen på">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+      </button>
+      <button class="tbtn tbtn-w" id="btn-hamburger" onclick="openHamburger()" title="Meny" style="display:none">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+    </div>
+  </div>
+</div>
+<div id="prog-wrap"><div id="prog-bar"></div></div>
+<div id="spacer"></div>
+
+<!-- ── HAMBURGER PANEL ─────────────────────────────────────── -->
+<div id="hamburger-overlay" onclick="closeHamburger()"></div>
+<div id="hamburger-panel">
+  <div id="hm-header">
+    <span id="hm-title">MENY</span>
+    <button id="hm-close" onclick="closeHamburger()">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+    </button>
+  </div>
+  <div id="hm-body">
+    <div class="hm-section">PLOCKNING</div>
+    <button class="hm-item" id="hm-kunder" style="display:none" onclick="closeHamburger();openKundlista()">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+      Kundlista
+    </button>
+    <button class="hm-item" id="hm-vikter" style="display:none" onclick="closeHamburger();openVikterModal()">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2L3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z"/><line x1="3" y1="6" x2="21" y2="6"/><path d="M16 10a4 4 0 0 1-8 0"/></svg>
+      Vikter
+    </button>
+    <button class="hm-item" id="hm-chauf" style="display:none" onclick="closeHamburger();openChauffor()">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="1" y="3" width="15" height="13" rx="2"/><path d="M16 8h4l3 5v3h-7V8z"/><circle cx="5.5" cy="18.5" r="2.5"/><circle cx="18.5" cy="18.5" r="2.5"/></svg>
+      Chaufförsvy
+    </button>
+    <button class="hm-item" id="hm-cat" style="display:none" onclick="closeHamburger();openCatOrderModal()">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
+      Kategorier
+    </button>
+    <div class="hm-sep"></div>
+    <div class="hm-section">DELA &amp; EXPORTERA</div>
+    <button class="hm-item" id="hm-print" style="display:none" onclick="closeHamburger();window.print()">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg>
+      Skriv ut
+    </button>
+    <button class="hm-item" id="hm-share" style="display:none" onclick="closeHamburger();_openShareModal()">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>
+      Dela / Exportera
+    </button>
+    <div class="hm-sep"></div>
+    <button class="hm-item hm-danger" id="hm-clear" style="display:none" onclick="closeHamburger();clearAll()">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
+      Rensa lista
+    </button>
+  </div>
+</div>
+
+<!-- ── UTSKRIFTSHUVUD ──────────────────────────────────────── -->
+<div id="print-header">
+  <h1>PLOCKFLOW</h1>
+  <p id="print-meta"></p>
+</div>
+
+<!-- ── HUVUD-INNEHÅLL ─────────────────────────────────────── -->
+<div id="main">
+  <div id="import-panel">
+    <div class="drop-zone" id="unified-zone"
+      ondrop="onUnifiedDrop(event)"
+      ondragover="onDragOver(event,'unified-zone')"
+      ondragleave="onDragLeave(event,'unified-zone')"
+      onclick="document.getElementById('unified-file-input').click()">
+      <div class="dz-title" id="unified-zone-title">Ladda upp CSV eller PDF</div>
+      <div class="dz-sub">Tryck eller dra hit · CSV, PDF, JSON · flera filer OK</div>
+      <input type="file" id="unified-file-input" accept=".csv,.txt,.pdf,.json" multiple onchange="onUnifiedFileSelect(event)"/>
+    </div>
+    <div id="pdf-status"></div>
+    <div class="paste-footer">
+      <button class="ibtn ibtn-s" onclick="openPasteModal()">Klistra in CSV</button>
+    </div>
+  </div>
+
+  <div id="msg-area"></div>
+  <div id="empty-state"><div>Importera data ovan för att börja plocka</div></div>
+  <div id="plocklista"></div>
+  <div id="print-kundkort"  style="display:none"></div>
+  <div id="print-kombinerad" style="display:none"></div>
+</div>
+
+<!-- ── PASTE-MODAL ─────────────────────────────────────────── -->
+<div id="paste-modal" class="modal-overlay" onclick="if(event.target===this)closePasteModal()">
+  <div class="modal-box" style="max-width:600px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+      <span style="font-family:var(--mono);font-size:12px;font-weight:700;letter-spacing:0.1em">KLISTRA IN CSV</span>
+      <button class="tbtn tbtn-r" onclick="closePasteModal()" style="font-size:12px;padding:4px 10px">✕</button>
+    </div>
+    <textarea id="paste-area" style="width:100%;min-height:120px;resize:vertical;font-family:var(--mono);font-size:12px;border:1px solid var(--border);border-radius:6px;padding:10px;outline:none;background:#f8f6f2;color:var(--text)"
+      placeholder="orderNr;kund;artNr;beskrivning;antal;enhet;datum;levAdress;faktAdress;ref;tel;senast;kundNr&#10;1001;Restaurang AB;10234;Ryggfile;27;kg;2024-04-20;Storgatan 1;Fakturavägen 2;Anna;070-1234567;14:00;1001"></textarea>
+    <div style="display:flex;gap:8px;margin-top:10px;align-items:center">
+      <button class="ibtn ibtn-p" onclick="importFromPaste()">Importera</button>
+      <span style="font-size:10px;color:var(--muted);font-family:var(--mono)">orderNr · kund · artNr · beskr · antal · enhet · datum · levAdress · faktAdress · ref · tel · senast · kundNr</span>
+    </div>
+  </div>
+</div>
+
+<!-- ── VIKTER-MODAL ──────────────────────────────────────────── -->
+<div id="vikter-modal" class="modal-overlay" onclick="if(event.target===this)closeVikterModal()">
+  <div class="modal-box" style="max-width:560px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <span style="font-family:var(--mono);font-size:12px;font-weight:700;letter-spacing:0.1em">VIKTER PER KUND</span>
+      <button class="tbtn tbtn-r" onclick="closeVikterModal()" style="font-size:12px;padding:4px 10px">✕</button>
+    </div>
+    <div id="vikter-modal-body"></div>
+    <div style="margin-top:12px;display:flex;gap:8px">
+      <button class="ibtn ibtn-p" onclick="copyVikter()">Kopiera text</button>
+      <button class="ibtn ibtn-s" onclick="closeVikterModal()">Stäng</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── KOMMENTAR-MODAL ─────────────────────────────────────── -->
+<div id="kommentar-modal" class="modal-overlay" onclick="if(event.target===this)closeKommentarModal()">
+  <div class="modal-box" style="max-width:480px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+      <span id="kommentar-modal-title" style="font-size:15px;font-weight:700"></span>
+      <button class="tbtn tbtn-r" onclick="closeKommentarModal()" style="font-size:12px;padding:4px 10px">✕</button>
+    </div>
+    <textarea id="kommentar-textarea" style="width:100%;min-height:80px;resize:vertical;font-family:var(--sans);font-size:14px;border:1px solid var(--border);border-radius:6px;padding:10px;outline:none" placeholder="Skriv kommentar…"></textarea>
+    <div style="display:flex;gap:8px;margin-top:10px">
+      <button class="ibtn ibtn-p" onclick="saveKommentar()">Spara</button>
+      <button class="ibtn ibtn-s" onclick="closeKommentarModal()">Avbryt</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── ORDER-PANEL ─────────────────────────────────────────── -->
+<div id="order-panel" class="modal-overlay" onclick="if(event.target===this)closeOrderPanel()">
+  <div class="modal-box" style="max-width:600px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+      <h2 id="order-panel-title" style="font-family:var(--mono);font-size:13px;letter-spacing:0.1em">ORDER</h2>
+      <button class="tbtn tbtn-r" onclick="closeOrderPanel()" style="font-size:12px;padding:4px 10px">✕ Stäng</button>
+    </div>
+    <div id="order-panel-body"></div>
+  </div>
+</div>
+
+<!-- ── KUNDPANEL ────────────────────────────────────────────── -->
+<div id="kund-panel" class="modal-overlay" style="z-index:500" onclick="if(event.target===this)closeKundPanel()">
+  <div class="modal-box" style="max-width:560px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+      <span id="kund-panel-title" style="font-size:20px;font-weight:700"></span>
+      <button class="tbtn tbtn-r" onclick="closeKundPanel()" style="font-size:12px;padding:4px 10px">✕ Stäng</button>
+    </div>
+    <div id="kund-panel-body"></div>
+  </div>
+</div>
+
+<!-- ── KUNDLISTA-PANEL ─────────────────────────────────────── -->
+<div id="kundlista-panel" class="modal-overlay" style="z-index:300" onclick="if(event.target===this)closeKundlista()">
+  <div class="modal-box" style="max-width:680px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <h2 style="font-size:14px;font-family:var(--mono);letter-spacing:0.1em">KUNDER</h2>
+      <button class="tbtn tbtn-r" onclick="closeKundlista()" style="font-size:12px;padding:4px 10px">✕ Stäng</button>
+    </div>
+    <div id="kundlista-cards"></div>
+  </div>
+</div>
+
+<!-- ── CHAUFFÖRSVY ─────────────────────────────────────────── -->
+<div id="chauf-panel">
+
+  <!-- Sorteringsoverlay -->
+  <div id="cd-sorting-overlay">
+    <div class="cd-spinner"></div>
+    <div class="cd-sort-label">SORTERAR RUTT&#8230;</div>
+  </div>
+
+  <!-- Sticky toprad -->
+  <div id="cd-header">
+    <div id="cd-progress-track"><div id="cd-progress-fill"></div></div>
+    <div id="cd-header-row">
+      <button id="cd-back-btn" onclick="closeChauffor()" aria-label="Tillbaka">&#8592;</button>
+      <div id="cd-counter">&#8212; <span>/ &#8212;</span></div>
+      <button id="cd-wakelock-btn" onclick="toggleWakeLock()" aria-label="Hall skärmen tänd">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+          <circle cx="12" cy="12" r="4"/><line x1="12" y1="2" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22"/>
+          <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/>
+          <line x1="2" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22" y2="12"/>
+          <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
+        </svg>
+      </button>
+      <button id="cd-sort-btn" onclick="chaufResort()" aria-label="Sortera rutten">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 6h18M7 12h10M11 18h2"/>
+        </svg>
+      </button>
+    </div>
+  </div>
+
+  <!-- Stoppkort -->
+  <div id="cd-list"></div>
+
+  <!-- Tom vy -->
+  <div id="cd-empty">
+    <div id="cd-empty-icon">&#128230;</div>
+    <div id="cd-empty-text">Inga stopp att visa.</div>
+  </div>
+
+</div>
+
+<!-- ── AVLASTNINGSVY ──────────────────────────────────────────── -->
+<div id="cd-unload-panel">
+  <div id="cd-ul-header">
+    <button id="cd-ul-back" onclick="closeUnloadPanel()">&#8592;</button>
+    <div id="cd-ul-title">Kund</div>
+    <div id="cd-ul-badge">0 artiklar</div>
+  </div>
+  <div id="cd-ul-list"></div>
+</div>
+
+<script>
+"use strict";
+
+/* ══════════════════════════════════════════════════════════════
+   §1 — KONSTANTER & KONFIGURATION
+   ══════════════════════════════════════════════════════════════ */
+const SK_STATE   = "plockflow_state_v4";
+const SK_DATE    = "plockflow_delivery_date_v1";
+const SK_KUNDMAP = "plockflow_kundmap_v1";
+const SK_CATMAP  = "plockflow_catmap_v1"; // artNr → catId, persists between sessions
+
+const PDF_ARTNR_MAX    = 110;
+const PDF_BESKR_MAX    = 320;
+const PDF_ANTAL_MAX    = 445;
+const PDF_FOOTER_Y     = 120;
+const PDF_ROW_Y_THRESH = 5;
+
+const PDFJS_URL        = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
+const PDFJS_WORKER_URL = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+
+// Snickaregatan 3, Habo
+const HUB_LAT = 57.9105;
+const HUB_LON = 14.0892;
+
+let WARNING_DATE = null;
+
+/* ══════════════════════════════════════════════════════════════
+   §2 — STATE & STORAGE
+   ══════════════════════════════════════════════════════════════ */
+let state = { articles: [], checked: {}, kommentarer: {}, deliveryOrder: [], weights: {}, chaufDone: {}, catOrder: [] };
+// deliveryOrder: [kundNamn, …] — leveransordning som styr plocklistan (sist levereras = packas först)
+let deliveryDate = "";
+
+// Chaufförsvy-state
+const chaufState = {
+  get order()    { return state.deliveryOrder; },
+  set order(v)   { state.deliveryOrder = v; },
+  get done()     { return state.chaufDone || (state.chaufDone = {}); },
+  set done(v)    { state.chaufDone = v; },
+  geoCache: {},   // { kundNamn: {lat,lon} | null }
+};
+
+function loadPersistedData() {
+  try { const s = localStorage.getItem(SK_STATE);   if (s) state          = JSON.parse(s); } catch(e) {}
+  try { const d = localStorage.getItem(SK_DATE);    if (d) deliveryDate   = d;             } catch(e) {}
+  try { const k = localStorage.getItem(SK_KUNDMAP); if (k) window._kundMap = JSON.parse(k); } catch(e) {}
+  try { const c = localStorage.getItem(SK_CATMAP);  if (c) window._catMap  = JSON.parse(c); } catch(e) {}
+  // Säkerställ att alla fält alltid finns, oavsett hur gammal sparad data är
+  if (!state.articles)      state.articles      = [];
+  if (!state.checked)       state.checked       = {};
+  if (!state.kommentarer)   state.kommentarer   = {};
+  if (!state.deliveryOrder) state.deliveryOrder = [];
+  if (!state.weights)       state.weights       = {};
+  if (!state.chaufDone)     state.chaufDone     = {};
+  if (!state.catOrder || !state.catOrder.length) state.catOrder = [];
+}
+
+function persistState() {
+  try {
+    localStorage.setItem(SK_STATE, JSON.stringify(state));
+    if (window._kundMap) localStorage.setItem(SK_KUNDMAP, JSON.stringify(window._kundMap));
+    if (window._catMap)  localStorage.setItem(SK_CATMAP,  JSON.stringify(window._catMap));
+    if (deliveryDate) localStorage.setItem(SK_DATE, deliveryDate);
+  } catch(e) {
+    showMessages([{ type:"warn", text:"Kunde inte spara lokalt (localStorage är fullt?)." }]);
+  }
+}
+
+function persistDate() {
+  try { localStorage.setItem(SK_DATE, deliveryDate); } catch(e) {}
+}
+
+/* ══════════════════════════════════════════════════════════════
+   §3 — DATUMHJÄLPARE
+   ══════════════════════════════════════════════════════════════ */
+const todayISO  = () => new Date().toISOString().slice(0, 10);
+const isDatePast = d => !!d && !!WARNING_DATE && d < WARNING_DATE;
+
+function fmtDate(iso) {
+  if (!iso) return "";
+  const [y, m, d] = iso.split("-");
+  return `${d}/${m}/${y}`;
+}
+
+function normalizeDate(raw) {
+  if (!raw) return "";
+  const s = raw.trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  const dmy = s.match(/^(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{4})$/);
+  if (dmy) return `${dmy[3]}-${dmy[2].padStart(2,"0")}-${dmy[1].padStart(2,"0")}`;
+  if (/^\d{8}$/.test(s)) return `${s.slice(0,4)}-${s.slice(4,6)}-${s.slice(6,8)}`;
+  const SV = { jan:"01",feb:"02",mar:"03",apr:"04",maj:"05",jun:"06",jul:"07",aug:"08",sep:"09",okt:"10",nov:"11",dec:"12" };
+  const sv = s.match(/^(\d{1,2})\s+([a-zA-ZåäöÅÄÖ]+)\s+(\d{4})$/);
+  if (sv) { const mon = SV[sv[2].toLowerCase().slice(0,3)]; if (mon) return `${sv[3]}-${mon}-${sv[1].padStart(2,"0")}`; }
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? "" : d.toISOString().slice(0,10);
+}
+
+/* ══════════════════════════════════════════════════════════════
+   §4 — CSV-PARSER
+   ══════════════════════════════════════════════════════════════ */
+function parseCSV(text) {
+  const lines = text.trim().split(/\r?\n/).filter(l => l.trim());
+  if (!lines.length) return { rows:[], errors:["Tom indata."] };
+
+  const delim = lines[0].includes(";") ? ";" : ",";
+
+  function parseLine(line) {
+    const cells = []; let cur = "", inQ = false;
+    for (const ch of line) {
+      if (ch === '"') { inQ = !inQ; continue; }
+      if (ch === delim && !inQ) { cells.push(cur.trim()); cur = ""; continue; }
+      cur += ch;
+    }
+    cells.push(cur.trim());
+    return cells;
+  }
+
+  const header = parseLine(lines[0]).map(h => h.toLowerCase().replace(/[\.\s]/g,""));
+  const find   = (...names) => { for (const n of names) { const i = header.findIndex(h => h.includes(n)); if (i >= 0) return i; } return -1; };
+
+  const COL = {
+    orderNr:        find("ordernr","order","ordid"),
+    kund:           find("kund","customer","kundnamn","client"),
+    artNr:          find("artnr","artikelnr","artikelnummer","itemno","itemid"),
+    beskrivning:    find("beskrivning","beskr","description","artikel","name","varunamn"),
+    antal:          find("antal","qty","quantity","amount","st"),
+    enhet:          find("enhet","unit","uom"),
+    orderDate:      find("orderdate","orderdatum","datum","date"),
+    leveransDatum:  find("leveransdatum","deliverydate","levdatum"),
+    leveransAdress: find("leveransadress","deliveryaddress","levadress","leveradr"),
+    fakturaAdress:  find("fakturaadress","invoiceaddress","fakturadr","billingaddress"),
+    referens:       find("referens","ref","reference","erref"),
+    telefon:        find("telefon","tel","phone","mobil","mobilnr"),
+    senasteLeverans:find("senastelevans","senasteleverstid","leveranstid","latest","senast"),
+    kundNr:         find("kundnr","kundnummer","customernr","customerid","kundid"),
+  };
+
+  const req = ["orderNr","kund","artNr","beskrivning","antal","enhet"];
+  const missing = req.filter(k => COL[k] < 0);
+  if (missing.length) return { rows:[], errors:[`Saknade kolumn${missing.length !== 1 ? "er" : ""}: ${missing.join(", ")}. Hittade: ${header.join(", ")}`] };
+
+  const errors = [], rows = [];
+  const g = (row, col) => col >= 0 ? (row[col] || "").trim() : "";
+
+  for (let li = 1; li < lines.length; li++) {
+    const row = parseLine(lines[li]);
+    const ln  = li + 1;
+    const orderNr     = g(row, COL.orderNr);
+    const kund        = g(row, COL.kund);
+    const artNr       = g(row, COL.artNr);
+    const beskrivning = g(row, COL.beskrivning);
+    const enhet       = g(row, COL.enhet);
+    const antalStr    = g(row, COL.antal).replace(",",".");
+    if (!artNr)                 { errors.push(`Rad ${ln}: Saknar artikelnummer.`);          continue; }
+    if (!/^\d+$/.test(artNr))   { errors.push(`Rad ${ln}: Ogiltigt artikelnummer "${artNr}".`); continue; }
+    if (!orderNr)               { errors.push(`Rad ${ln}: Saknar ordernummer.`);             continue; }
+    if (!kund)                  { errors.push(`Rad ${ln}: Saknar kundnamn.`);                continue; }
+    const antal = parseFloat(antalStr);
+    if (isNaN(antal) || antal <= 0) { errors.push(`Rad ${ln}: Ogiltigt antal "${antalStr}".`); continue; }
+    rows.push({
+      orderNr, kund, artNr, beskrivning, enhet, antal,
+      orderDate:       normalizeDate(g(row, COL.orderDate)),
+      leveransDatum:   normalizeDate(g(row, COL.leveransDatum)),
+      leveransAdress:  g(row, COL.leveransAdress),
+      fakturaAdress:   g(row, COL.fakturaAdress),
+      referens:        g(row, COL.referens),
+      telefon:         g(row, COL.telefon),
+      senasteLeverans: g(row, COL.senasteLeverans),
+      kundNr:          g(row, COL.kundNr),
+    });
+  }
+  return { rows, errors };
+}
+
+/* ══════════════════════════════════════════════════════════════
+   §5 — PDF-PARSER (Visma eEkonomi)
+   ══════════════════════════════════════════════════════════════ */
+async function parsePDFFile(file, lib) {
+  const buffer = await file.arrayBuffer();
+  const pdf    = await lib.getDocument({ data: buffer }).promise;
+  const rows   = [];
+  let orderNr = file.name.replace(/\.pdf$/i,""), customerName = orderNr;
+  let orderDate = "", leveransDatum = "", pdfKundNr = "", pdfRef = "", pdfAddr = "";
+
+  for (let pn = 1; pn <= pdf.numPages; pn++) {
+    const items = (await (await pdf.getPage(pn)).getTextContent()).items
+      .filter(i => i.str && i.str.trim())
+      .map(i => ({ str: i.str.trim(), x: i.transform[4], y: i.transform[5] }));
+
+    if (pn === 1) {
+      const sorted   = [...items].sort((a,b) => b.y - a.y || a.x - b.x);
+      const fullText = sorted.map(i => i.str).join(" ");
+      const om = fullText.match(/Ordernummer\s+(\d+)/);         if (om) orderNr = om[1];
+      const dm = fullText.match(/Orderdatum\s+([\d\-\/]+)/);   if (dm) orderDate = normalizeDate(dm[1]);
+      const lm = fullText.match(/[Pp]lanerat\s+leveransdatum\s+([\d\-\/]+)/); if (lm) leveransDatum = normalizeDate(lm[1]);
+      if (!leveransDatum) { const l2 = fullText.match(/Leveransdatum\s+([\d\-\/]+)/i); if (l2) leveransDatum = normalizeDate(l2[1]); }
+      if (!orderDate)     { const im = fullText.match(/\b(\d{4}-\d{2}-\d{2})\b/);     if (im) orderDate = im[1]; }
+      const km = fullText.match(/Kundnr\s+(\d+)|Kundnummer\s+(\d+)/); if (km) pdfKundNr = (km[1]||km[2]).trim();
+      const rm = fullText.match(/Er referens\s+(.*?)(?:\s+(?:Bet villkor|Orderdatum|Kundnr|\d{5}\s))/);
+      if (rm) pdfRef = rm[1].trim().replace(/\s+[A-ZÅÄÖ]+\s+\d.*$/,"").trim();
+      const SKIP = new Set(["Orderbekräftelse","Ordernummer","Orderdatum","Sida","av","Leveransadress"]);
+      const ci = items.filter(i => i.x>300 && i.y>680 && i.y<780 && !SKIP.has(i.str) && !/^\d+$/.test(i.str)).sort((a,b) => b.y-a.y||a.x-b.x);
+      if (ci[0]) customerName = ci[0].str;
+      const lbl = items.find(i => i.str === "Leveransadress");
+      if (lbl) {
+        const thdr = items.find(i => i.str==="Art.nr"||i.str==="Beskrivning");
+        const thY  = thdr ? thdr.y : lbl.y - 100;
+        const ai   = items.filter(i => i.x>250 && i.y<=lbl.y+5 && i.y>=thY && i.str!=="Sverige" && i.str!==customerName && i.str!=="Leveransadress" && !/^(Art\.nr|Beskrivning|Antal|Enhet|À-pris|Summa)$/.test(i.str)).sort((a,b) => b.y-a.y||a.x-b.x);
+        if (ai.length) pdfAddr = ai.map(i => i.str).join(", ");
+      }
+    }
+
+    const SKIP_RE = /^(Art\.nr|Beskrivning|Antal|Enhet|À-pris|Summa|Momsspecifikation|Momssats|Pris ex moms|Moms|Exkl\.|Avrundning|Planerat|leveransdatum|Totalbelopp|Dröjsmålsränta|Bet villkor|debiteras|ränta|enligt|räntelagen)$/i;
+    const ti = items.filter(i => i.y >= PDF_FOOTER_Y && i.y <= 620 && !SKIP_RE.test(i.str));
+    ti.sort((a,b) => b.y-a.y||a.x-b.x);
+    const tRows = [];
+    for (const item of ti) {
+      let row = tRows.find(r => Math.abs(r.y - item.y) <= PDF_ROW_Y_THRESH);
+      if (!row) { row = { y: item.y, artnr:[], beskr:[], antal:[] }; tRows.push(row); }
+      if      (item.x < PDF_ARTNR_MAX) row.artnr.push(item.str);
+      else if (item.x < PDF_BESKR_MAX) row.beskr.push(item.str);
+      else if (item.x < PDF_ANTAL_MAX) row.antal.push(item.str);
+    }
+    tRows.sort((a,b) => b.y-a.y);
+
+    for (let i = 0; i < tRows.length; i++) {
+      const row   = tRows[i];
+      const artNr = row.artnr.join("").trim();
+      if (!/^\d{3,}$/.test(artNr)) continue;
+      let beskrivning = row.beskr.join(" ").trim();
+      if (!beskrivning) {
+        const nb = ti.filter(it => it.x>=PDF_ARTNR_MAX && it.x<PDF_BESKR_MAX && Math.abs(it.y-row.y)<=12);
+        beskrivning = nb.map(x=>x.str).join(" ").trim();
+      }
+      for (let j = i+1; j < tRows.length; j++) {
+        if (/^\d{3,}$/.test(tRows[j].artnr.join("").trim())) break;
+        const nb = tRows[j].beskr.join(" ").trim();
+        if (tRows[j].antal.length || /^(Planerat|Moms|Exkl|Avr|Total|Pris)/i.test(nb)) break;
+        if (nb) beskrivning += " " + nb;
+      }
+      // Filter out À-prices that may land in the antal column.
+      // À-prices look like e.g. "329,90" (large number, exactly 2 decimal places).
+      // Real quantities are integers or small decimals like "20", "881", "1,00".
+      const antalTokens = row.antal.filter(t => !/^\d{3,},\d{2}$/.test(t.trim()));
+      const am = antalTokens.join(" ").match(/([\d,]+)\s*([a-zA-ZåäöÅÄÖ]*)/);
+      const antal = am ? parseFloat(am[1].replace(",",".")) : 0;
+      const enhet = am ? am[2] : "";
+      if (antal > 0) rows.push({ orderNr, kund: customerName, artNr, beskrivning: beskrivning.trim(), enhet, antal, orderDate, leveransDatum, leveransAdress: pdfAddr, fakturaAdress:"", referens: pdfRef, telefon:"", senasteLeverans:"", kundNr: pdfKundNr });
+    }
+  }
+  return rows;
+}
+
+/* ══════════════════════════════════════════════════════════════
+   §6 — PDF.js LOADER
+   ══════════════════════════════════════════════════════════════ */
+let _pdfJsPromise = null;
+function loadPdfJs() {
+  if (_pdfJsPromise) return _pdfJsPromise;
+  _pdfJsPromise = new Promise((res, rej) => {
+    if (window.pdfjsLib) { res(window.pdfjsLib); return; }
+    const s = document.createElement("script");
+    s.src    = PDFJS_URL;
+    s.onload = () => { window.pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_WORKER_URL; res(window.pdfjsLib); };
+    s.onerror = () => rej(new Error("Kunde inte ladda PDF.js — kontrollera internetanslutningen. CSV fungerar offline."));
+    document.head.appendChild(s);
+  });
+  return _pdfJsPromise;
+}
+
+/* ══════════════════════════════════════════════════════════════
+   §7 — AGGREGERING
+   ══════════════════════════════════════════════════════════════ */
+function aggregateRows(rows) {
+  const artMap  = {};
+  const kundMap = {};
+
+  for (const r of rows) {
+    if (r.kund) {
+      if (!kundMap[r.kund]) kundMap[r.kund] = { leveransAdress:"", fakturaAdress:"", referens:"", telefon:"", senasteLeverans:"", kundNr:"", orderDates:[], leveransDates:[] };
+      const ki = kundMap[r.kund];
+      if (r.leveransAdress)  ki.leveransAdress  = r.leveransAdress;
+      if (r.fakturaAdress)   ki.fakturaAdress   = r.fakturaAdress;
+      if (r.referens)        ki.referens        = r.referens;
+      if (r.telefon)         ki.telefon         = r.telefon;
+      if (r.kundNr)          ki.kundNr          = r.kundNr;
+      if (r.senasteLeverans && (!ki.senasteLeverans || r.senasteLeverans > ki.senasteLeverans)) ki.senasteLeverans = r.senasteLeverans;
+      if (r.orderDate    && !ki.orderDates.includes(r.orderDate))     ki.orderDates.push(r.orderDate);
+      if (r.leveransDatum && !ki.leveransDates.includes(r.leveransDatum)) ki.leveransDates.push(r.leveransDatum);
+    }
+    if (!artMap[r.artNr]) artMap[r.artNr] = { artNr: r.artNr, beskrivning: r.beskrivning || r.artNr, enhet: r.enhet, total: 0, earliestDate: r.orderDate || "", orderRefs: [] };
+    const art = artMap[r.artNr];
+    art.total += r.antal;
+    if (r.orderDate && (!art.earliestDate || r.orderDate < art.earliestDate)) art.earliestDate = r.orderDate;
+    art.orderRefs.push({ orderNr: r.orderNr, kund: r.kund, antal: r.antal, orderDate: r.orderDate || "", leveransDatum: r.leveransDatum || "" });
+  }
+
+  const existing = window._kundMap || {};
+  for (const [namn, ki] of Object.entries(kundMap)) {
+    if (!existing[namn]) { existing[namn] = ki; continue; }
+    const e = existing[namn];
+    if (ki.leveransAdress)  e.leveransAdress  = ki.leveransAdress;
+    if (ki.fakturaAdress)   e.fakturaAdress   = ki.fakturaAdress;
+    if (ki.referens)        e.referens        = ki.referens;
+    if (ki.telefon)         e.telefon         = ki.telefon;
+    if (ki.kundNr)          e.kundNr          = ki.kundNr;
+    if (ki.senasteLeverans) e.senasteLeverans = ki.senasteLeverans;
+    for (const d of ki.orderDates)    if (!e.orderDates.includes(d))    e.orderDates.push(d);
+    for (const d of ki.leveransDates) if (!e.leveransDates.includes(d)) e.leveransDates.push(d);
+  }
+  window._kundMap = existing;
+
+  return Object.values(artMap).sort((a,b) => parseInt(a.artNr) - parseInt(b.artNr));
+}
+
+/* ══════════════════════════════════════════════════════════════
+   §8 — VALIDERING
+   ══════════════════════════════════════════════════════════════ */
+function validateArticles(articles) {
+  const w = [];
+  const noBeskr = articles.filter(a => !a.beskrivning || a.beskrivning === a.artNr);
+  if (noBeskr.length) w.push(`${noBeskr.length} artikel${noBeskr.length !== 1 ? "er" : ""} saknar beskrivning: ${noBeskr.map(a => a.artNr).join(", ")}`);
+  const allC = [...new Set(articles.flatMap(a => a.orderRefs.map(r => r.kund)))];
+  const lmap = {};
+  for (const c of allC) { const l = c.toLowerCase().trim(); (lmap[l] = lmap[l] || []).push(c); }
+  const dupes = Object.values(lmap).filter(a => a.length > 1);
+  if (dupes.length) w.push(`Möjliga namndubblett${dupes.length !== 1 ? "er" : ""}: ${dupes.map(d => d.join(" / ")).join("; ")}`);
+  if (WARNING_DATE) {
+    const past = articles.filter(a => a.earliestDate && isDatePast(a.earliestDate)).map(a => `${a.artNr} (${fmtDate(a.earliestDate)})`);
+    if (past.length) w.push(`Passerat orderdatum: ${past.slice(0, 5).join(", ")}${past.length > 5 ? ` …+${past.length - 5} till` : ""}`);
+  }
+  return w;
+}
+
+/* ══════════════════════════════════════════════════════════════
+   §9 — PLOCKLISTA — RENDERING
+   ══════════════════════════════════════════════════════════════ */
+const formatAntal = n => n % 1 === 0 ? String(n) : n.toFixed(2).replace(".",",");
+const escHtml     = s => String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+
+function countUniqueCustomers() {
+  const s = new Set(); state.articles.forEach(a => a.orderRefs.forEach(r => s.add(r.kund))); return s.size;
+}
+function updatePrintMeta() {
+  const parts = [];
+  const nc = countUniqueCustomers(); if (nc) parts.push(`${nc} kund${nc !== 1 ? "er" : ""}`);
+  const t  = state.articles.length;  if (t)  parts.push(`${t} artikel${t !== 1 ? "er" : ""}`);
+  const el = document.getElementById("print-meta"); if (el) el.textContent = parts.join("  ·  ");
+}
+function updateDateWarnings() { WARNING_DATE = todayISO(); }
+
+function render() {
+  const { articles, checked } = state;
+  const total = articles.length;
+  const done  = articles.filter(a => checked[a.artNr]).length;
+
+  document.getElementById("topbar-meta").textContent = total ? `${done} / ${total}` : "";
+  document.getElementById("prog-bar").style.width       = total ? `${(done/total)*100}%` : "0%";
+
+  // Show hamburger and menu items when data is loaded
+  const hasData = total > 0;
+  document.getElementById("btn-hamburger").style.display = hasData ? "" : "none";
+  ["hm-print","hm-clear","hm-kunder","hm-chauf","hm-vikter","hm-cat","hm-share"].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.style.display = hasData ? "" : "none";
+  });
+  // kunder/chauf only if kundmap has data
+  const hasKunder = Object.keys(window._kundMap || {}).length > 0;
+  const kmEl = document.getElementById("hm-kunder");
+  if (kmEl) kmEl.style.display = (hasData && hasKunder) ? "" : "none";
+  const chEl = document.getElementById("hm-chauf");
+  if (chEl) chEl.style.display = (hasData && hasKunder) ? "" : "none";
+  document.getElementById("empty-state").classList.toggle("show", total===0);
+  updatePrintMeta();
+  updateDateWarnings();
+
+  const container = document.getElementById("plocklista");
+  if (!total) { container.innerHTML = ""; renderPrintKundkort(); return; }
+
+  const km = window._kundMap || {};
+
+  // Sort articles by delivery order: last stop delivered = packed first (top of plocklista)
+  // Articles get a priority score = the EARLIEST stop index among their customers
+  // Reversed: stop N (delivered last) → should be PACKED first → appears at TOP
+  const delivOrder = state.deliveryOrder || [];
+  const stopCount  = delivOrder.length;
+
+  // Classify articles into categories
+  const _artCats = new Map(articles.map(a => [a.artNr, _classifyArticle(a)]));
+
+  const sortedArticles = [...articles].sort((a, b) => {
+    const catA = _artCats.get(a.artNr);
+    const catB = _artCats.get(b.artNr);
+    const _ord = _getCatOrder();
+    const catOrderA = _ord.indexOf(catA.id);
+    const catOrderB = _ord.indexOf(catB.id);
+
+    // Primary sort: category order (fisk frys first etc)
+    if (catOrderA !== catOrderB) return catOrderA - catOrderB;
+
+    // Secondary sort: delivery order (last stop → pack first = top)
+    const scoreA = Math.min(...a.orderRefs.map(r => {
+      const i = delivOrder.indexOf(r.kund);
+      return i < 0 ? stopCount : i;
+    }));
+    const scoreB = Math.min(...b.orderRefs.map(r => {
+      const i = delivOrder.indexOf(r.kund);
+      return i < 0 ? stopCount : i;
+    }));
+    if (scoreA !== scoreB) return scoreB - scoreA;
+    return parseInt(a.artNr) - parseInt(b.artNr);
+  });
+
+  let html = "";
+  let _lastCatId = null;
+  for (const art of sortedArticles) {
+    const isCk  = !!checked[art.artNr];
+    const past  = isDatePast(art.earliestDate);
+    const badge = art.earliestDate ? `<span class="art-date-badge${past?" art-date-past":""}">${fmtDate(art.earliestDate)}</span>` : "";
+
+    const _cat = _artCats.get(art.artNr);
+
+    // Category divider header between groups
+    if (_cat.id !== _lastCatId) {
+      _lastCatId = _cat.id;
+      html += `<div class="cat-divider" onclick="openCatOrderModal()" style="margin-top:${html ? "14px" : "0"}">
+        <div class="cat-divider-bar" style="background:${_cat.color}"></div>
+        <span class="cat-divider-label" style="color:${_cat.color}">${_cat.label}</span>
+        <div class="cat-divider-line" style="background:${_cat.border}"></div>
+      </div>`;
+    }
+
+    // Small inline badge (just icon, no text) for the row itself
+    const catBadge = "";
+
+    const detailRows = [...art.orderRefs].sort((a,b) => a.kund.localeCompare(b.kund,"sv")).map(ref => {
+      const ki    = km[ref.kund] || {};
+      const hasLev = ki.leveransAdress?.trim();
+      const hasFak = ki.fakturaAdress?.trim();
+      const addr  = hasLev || (hasFak ? ki.fakturaAdress : "");
+      const isFak = !hasLev && hasFak;
+      const mUrl  = addr ? `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(addr)}` : "";
+      const refPast = isDatePast(ref.orderDate);
+      const dateTag = ref.orderDate ? `<span class="ddate${refPast?" past":""}">${fmtDate(ref.orderDate)}</span>` : "";
+      const addrHtml = addr ? `<div class="daddr">${isFak?'<span class="daddr-warn">FAKTURAADRESS </span>':""}<a href="${escHtml(mUrl)}" target="_blank" class="addr-link">${escHtml(addr)}</a></div>` : "";
+      const refHtml  = ki.referens ? `<span class="dorder">Ref: ${escHtml(ki.referens)}</span>` : "";
+      const telHtml  = ki.telefon  ? `<span class="dorder"><a href="tel:${escHtml(ki.telefon)}">${escHtml(ki.telefon)}</a></span>` : "";
+      const timeHtml = ki.senasteLeverans ? `<span class="dtime">Senast ${escHtml(ki.senasteLeverans)}</span>` : "";
+      const kom      = (state.kommentarer||{})[ref.kund] || "";
+      const sON = escHtml(ref.orderNr), sK = escHtml(ref.kund);
+      const komHtml = kom
+        ? `<div class="dkommentar-text">${escHtml(kom)} <button class="dkommentar-btn" data-kund="${sK}" onclick="openKommentarModal(this.dataset.kund)">Ändra</button></div>`
+        : `<button class="dkommentar-btn" data-kund="${sK}" onclick="openKommentarModal(this.dataset.kund)">+ Kommentar</button>`;
+      return `<div class="drow">
+        <div style="flex:1;min-width:0">
+          <div class="dkund">${escHtml(ref.kund)}</div>
+          <div class="dmeta">
+            <button class="dorder-link" data-ordernr="${sON}" data-kund="${sK}" onclick="openOrderPanel(this.dataset.ordernr,this.dataset.kund)">Order #${sON}</button>
+            ${dateTag}${refHtml}${telHtml}${timeHtml}
+          </div>
+          ${addrHtml}${komHtml}
+        </div>
+        <div class="dantal" style="display:flex;flex-direction:column;align-items:flex-end;gap:4px">
+          ${(() => {
+            const wKey = art.artNr+"|"+ref.kund;
+            const w = (state.weights||{})[wKey];
+            if (art.enhet.toLowerCase()==="kg" && w != null) {
+              return `<span style="font-family:var(--mono);font-size:17px;font-weight:800;color:#14532d">${formatAntal(w)} kg</span>
+                      <span style="font-family:var(--mono);font-size:10px;color:var(--muted);text-decoration:line-through">${formatAntal(ref.antal)} kg</span>`;
+            }
+            return `<span>${formatAntal(ref.antal)} ${escHtml(art.enhet)}</span>`;
+          })()}
+          ${art.enhet.toLowerCase()==="kg" ? `<div style="display:flex;align-items:center;gap:3px" onclick="event.stopPropagation()">
+            <span style="font-family:var(--mono);font-size:9px;color:var(--muted)">vikt</span>
+            <input type="number" min="0" step="0.1" placeholder="—"
+              style="font-family:var(--mono);font-size:13px;font-weight:700;width:54px;border:1px solid var(--border);border-radius:4px;background:#fff;padding:2px 4px;text-align:right;outline:none;color:var(--text)"
+              value="${escHtml(String((state.weights||{})[ art.artNr+"|"+ref.kund] ?? ""))}"
+              data-artnr="${escHtml(art.artNr)}" data-kund="${sK}"
+              onchange="onWeightChange(this)" onkeydown="if(event.key==='Enter'){event.preventDefault();onWeightChange(this);this.blur()}" onclick="event.stopPropagation()"
+            />
+            <span style="font-family:var(--mono);font-size:9px;color:var(--muted)">/ ${formatAntal(ref.antal)} kg</span>
+          </div>` : ""}
+        </div>
+      </div>`;
+    }).join("");
+
+    html += `<div class="art-row${isCk?" done":""}" id="row-${art.artNr}" style="border-left:4px solid ${_cat.color};position:relative">
+      <div class="art-body" onclick="onRowClick(event,'${art.artNr}')">
+        <div class="art-chk" onclick="onCheckboxClick(event,'${art.artNr}')" style="cursor:pointer">
+          <input type="checkbox"${isCk?" checked":""} style="display:none" />
+          <div class="art-chk-visual">
+            <svg class="art-chk-tick" viewBox="0 0 14 14" fill="none" stroke="#fff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="2,7 5.5,10.5 12,3"/>
+            </svg>
+          </div>
+        </div>
+        <div class="art-info">
+          <div class="art-name">${escHtml(art.beskrivning)}</div>
+          <div class="art-meta">
+            <span class="art-nr">${escHtml(art.artNr)}</span>
+            <span class="_cat-swatch" data-artnr="${art.artNr}"
+              onclick="event.stopPropagation();_openCatPicker(event,'${art.artNr}')"
+              title="Ändra kategori"
+              style="display:inline-block;width:9px;height:9px;border-radius:50%;background:${_cat.color};cursor:pointer;flex-shrink:0;border:1.5px solid ${_cat.border};vertical-align:middle"></span>
+            ${badge}
+          </div>
+        </div>
+        <div class="art-qty">
+          ${(() => {
+            if (art.enhet.toLowerCase() === "kg") {
+              const ws = state.weights || {};
+              const weights = art.orderRefs.map(r => ws[art.artNr+"|"+r.kund]);
+              const allSet = weights.every(w => w != null);
+              const anySet = weights.some(w => w != null);
+              if (allSet) {
+                const tot = weights.reduce((s,w) => s+w, 0);
+                return `<div class="art-total" style="color:#14532d">${formatAntal(tot)}</div>
+                        <div class="art-unit" style="text-decoration:line-through">${formatAntal(art.total)} ${escHtml(art.enhet)}</div>`;
+              } else if (anySet) {
+                const tot = weights.filter(w => w != null).reduce((s,w) => s+w, 0);
+                return `<div class="art-total">${formatAntal(art.total)}</div>
+                        <div class="art-unit" style="color:#14532d">+${formatAntal(tot)} ${escHtml(art.enhet)}</div>`;
+              }
+            }
+            return `<div class="art-total">${formatAntal(art.total)}</div>
+                    <div class="art-unit">${escHtml(art.enhet)}</div>`;
+          })()}
+        </div>
+        <div class="art-arr" id="arr-${art.artNr}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="9 18 15 12 9 6"/></svg></div>
+      </div>
+      <div class="art-detail" id="det-${art.artNr}">${detailRows}</div>
+    </div>`;
+  }
+
+  container.innerHTML = html;
+  renderPrintKundkort();
+}
+
+/* ══════════════════════════════════════════════════════════════
+   §10 — PLOCKLISTA — INTERAKTIONER
+   ══════════════════════════════════════════════════════════════ */
+
+// ── HAMBURGER MENY ────────────────────────────────────────────
+function openHamburger() {
+  document.getElementById("hamburger-panel").classList.add("open");
+  document.getElementById("hamburger-overlay").classList.add("open");
+  document.body.style.overflow = "hidden";
+}
+function closeHamburger() {
+  document.getElementById("hamburger-panel").classList.remove("open");
+  document.getElementById("hamburger-overlay").classList.remove("open");
+  document.body.style.overflow = "";
+}
+
+function onRowClick(event, artNr) {
+  if (event.target.tagName === "INPUT") return;
+  const det = document.getElementById("det-"+artNr);
+  const arr = document.getElementById("arr-"+artNr);
+  if (!det) return;
+  const isOpen = det.classList.contains("open");
+  document.querySelectorAll(".art-detail.open").forEach(el => {
+    if (el.id !== "det-"+artNr) {
+      el.classList.remove("open");
+      const oa = document.getElementById("arr-"+el.id.replace("det-",""));
+      if (oa) oa.classList.remove("open");
+    }
+  });
+  det.classList.toggle("open", !isOpen);
+  if (arr) arr.classList.toggle("open", !isOpen);
+}
+
+function onCheckboxClick(event, artNr) {
+  event.stopPropagation();
+  const wasDone = !!state.checked[artNr];
+  state.checked[artNr] = !wasDone;
+  persistState();
+  const row = document.getElementById("row-"+artNr);
+  if (row) {
+    row.classList.toggle("done", !!state.checked[artNr]);
+    if (!wasDone) {
+      row.classList.add("just-done");
+      row.addEventListener("animationend", () => row.classList.remove("just-done"), { once: true });
+      const det = document.getElementById("det-"+artNr);
+      const arr = document.getElementById("arr-"+artNr);
+      if (det?.classList.contains("open")) { det.classList.remove("open"); arr?.classList.remove("open"); }
+      scrollToNextUnchecked(artNr);
+    }
+  }
+  const total = state.articles.length;
+  const done  = state.articles.filter(a => state.checked[a.artNr]).length;
+  document.getElementById("topbar-meta").textContent = `${done} / ${total}`;
+  document.getElementById("prog-bar").style.width    = `${(done/total)*100}%`;
+}
+
+function scrollToNextUnchecked(currentArtNr) {
+  // Hämta artikelordningen från DOM (speglar den sorterade plocklistan)
+  const rows = [...document.querySelectorAll(".art-row")];
+  const idx  = rows.findIndex(r => r.id === "row-" + currentArtNr);
+  for (let i = idx + 1; i < rows.length; i++) {
+    const artNr = rows[i].id.replace("row-", "");
+    if (!state.checked[artNr]) {
+      setTimeout(() => {
+        const off = (document.getElementById("topbar")?.offsetHeight || 52) + 20;
+        window.scrollTo({ top: rows[i].getBoundingClientRect().top + window.scrollY - off, behavior:"smooth" });
+      }, 100);
+      return;
+    }
+  }
+  setTimeout(() => window.scrollTo({ top:0, behavior:"smooth" }), 100);
+}
+
+function onWeightChange(input) {
+  const key = input.dataset.artnr + "|" + input.dataset.kund;
+  const val = parseFloat(input.value);
+  if (!state.weights) state.weights = {};
+  if (input.value === "" || isNaN(val) || val < 0) {
+    delete state.weights[key];
+    input.value = "";
+  } else {
+    state.weights[key] = val;
+  }
+  // Uppdatera antal-visningen i artikelraden utan att rita om hela listan
+  const artNr = input.dataset.artnr;
+  const art   = state.articles.find(a => a.artNr === artNr);
+  if (art) {
+    const ws      = state.weights;
+    const weights = art.orderRefs.map(r => ws[artNr + "|" + r.kund]);
+    const allSet  = weights.every(w => w != null);
+    const anySet  = weights.some(w => w != null);
+    const qtyEl   = document.querySelector(`#row-${artNr} .art-qty`);
+    if (qtyEl) {
+      if (allSet) {
+        const tot = weights.reduce((s, w) => s + w, 0);
+        qtyEl.innerHTML = `<div class="art-total" style="color:#14532d">${formatAntal(tot)}</div>
+                           <div class="art-unit" style="text-decoration:line-through">${formatAntal(art.total)} ${escHtml(art.enhet)}</div>`;
+      } else if (anySet) {
+        const tot = weights.filter(w => w != null).reduce((s, w) => s + w, 0);
+        qtyEl.innerHTML = `<div class="art-total">${formatAntal(art.total)}</div>
+                           <div class="art-unit" style="color:#14532d">+${formatAntal(tot)} ${escHtml(art.enhet)}</div>`;
+      } else {
+        qtyEl.innerHTML = `<div class="art-total">${formatAntal(art.total)}</div>
+                           <div class="art-unit">${escHtml(art.enhet)}</div>`;
+      }
+    }
+  }
+  persistState();
+}
+
+function _buildVikterText() {
+  // Group weights by customer: { kund: [ {beskrivning, antal, enhet, vikt} ] }
+  const w = state.weights || {};
+  if (!Object.keys(w).length) return null;
+
+  const byKund = {};
+  for (const [key, vikt] of Object.entries(w)) {
+    const sep   = key.indexOf("|");
+    const artNr = key.slice(0, sep);
+    const kund  = key.slice(sep + 1);
+    const art   = state.articles.find(a => a.artNr === artNr);
+    if (!art) continue;
+    const ref   = art.orderRefs.find(r => r.kund === kund);
+    if (!byKund[kund]) byKund[kund] = [];
+    byKund[kund].push({ beskrivning: art.beskrivning, artNr, antal: ref ? ref.antal : 0, enhet: art.enhet, vikt });
+  }
+
+  // Respect delivery order
+  const delivOrder = state.deliveryOrder || [];
+  const kundar = Object.keys(byKund).sort((a, b) => {
+    const ia = delivOrder.indexOf(a), ib = delivOrder.indexOf(b);
+    if (ia < 0 && ib < 0) return a.localeCompare(b, "sv");
+    if (ia < 0) return 1; if (ib < 0) return -1;
+    return ia - ib;
+  });
+
+  let text = "";
+  for (const kund of kundar) {
+    text += kund + "\n";
+    for (const r of byKund[kund]) {
+      text += `  ${r.beskrivning} — ${formatAntal(r.vikt)} kg\n`;
+    }
+    text += "\n";
+  }
+  return text.trim();
+}
+
+function openVikterModal() {
+  const body = document.getElementById("vikter-modal-body");
+  const text = _buildVikterText();
+  if (!text) {
+    body.innerHTML = `<p style="font-size:13px;color:var(--muted);font-family:var(--mono)">Inga vikter inlagda än. Expandera en kg-artikel och fyll i vikt per kund.</p>`;
+  } else {
+    body.innerHTML = `<pre id="vikter-text" style="font-family:var(--mono);font-size:13px;line-height:1.7;white-space:pre-wrap;background:#f8f6f2;border:1px solid var(--border);border-radius:6px;padding:12px;margin:0;overflow-x:auto">${escHtml(text)}</pre>`;
+  }
+  document.getElementById("vikter-modal").classList.add("open");
+}
+
+function closeVikterModal() {
+  document.getElementById("vikter-modal").classList.remove("open");
+}
+
+function copyVikter() {
+  const text = _buildVikterText();
+  if (!text) return;
+  navigator.clipboard.writeText(text).then(() => {
+    const btn = document.querySelector("#vikter-modal .ibtn-p");
+    const orig = btn.textContent;
+    btn.textContent = "✓ Kopierat!";
+    setTimeout(() => { btn.textContent = orig; }, 1800);
+  }).catch(() => {
+    const el = document.getElementById("vikter-text");
+    if (el) { const sel = window.getSelection(); const r = document.createRange(); r.selectNodeContents(el); sel.removeAllRanges(); sel.addRange(r); }
+  });
+}
+
+/* ══════════════════════════════════════════════════════════════
+   §11 — KUNDLISTA & KUNDPANEL
+   ══════════════════════════════════════════════════════════════ */
+function getUniqueCustomers() {
+  const km = window._kundMap || {}, seen = new Set(), list = [];
+  for (const art of state.articles) for (const ref of art.orderRefs) {
+    if (!seen.has(ref.kund)) {
+      seen.add(ref.kund);
+      const ki = km[ref.kund] || {};
+      list.push({ namn: ref.kund, leveransAdress: ki.leveransAdress||"", fakturaAdress: ki.fakturaAdress||"", referens: ki.referens||"", telefon: ki.telefon||"", senasteLeverans: ki.senasteLeverans||"", kundNr: ki.kundNr||"", orderDates: ki.orderDates||[], leveransDates: ki.leveransDates||[] });
+    }
+  }
+  return list;
+}
+
+function openKundlista() {
+  _renderKundlista();
+  document.getElementById("kundlista-panel").classList.add("open");
+}
+
+function _renderKundlista() {
+  const el = document.getElementById("kundlista-cards");
+  const allKunder = getUniqueCustomers();
+  if (!allKunder.length) { el.innerHTML = `<p style="color:var(--muted);font-size:13px">Inga kunder importerade.</p>`; return; }
+
+  // Build ordered list: deliveryOrder first, then remaining A–Ö
+  const ordered = (state.deliveryOrder || [])
+    .filter(n => allKunder.some(k => k.namn === n))
+    .map(n => allKunder.find(k => k.namn === n));
+  const unordered = allKunder
+    .filter(k => !ordered.some(o => o.namn === k.namn))
+    .sort((a, b) => a.namn.localeCompare(b.namn, "sv"));
+  const kunder = [...ordered, ...unordered];
+
+  el.innerHTML = `
+    <div style="font-family:var(--mono);font-size:10px;color:var(--muted);margin-bottom:8px;letter-spacing:0.06em">
+      LEVERANSORDNING — håll &amp; dra för att ändra · speglas i plocklistan
+    </div>
+    <div id="kundlista-drag-list">
+      ${kunder.map((k, idx) => {
+        const sN   = escHtml(k.namn);
+        const addr = k.leveransAdress?.trim() || k.fakturaAdress?.trim() || "";
+        const knr  = k.kundNr ? `<span style="font-family:var(--mono);font-size:10px;color:var(--muted);margin-left:6px">#${escHtml(k.kundNr)}</span>` : "";
+        const aStr = addr ? `<div style="font-size:11px;color:var(--muted);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(addr)}</div>` : "";
+        const tStr = k.telefon ? `<div style="font-size:11px;color:var(--muted);margin-top:1px">${escHtml(k.telefon)}</div>` : "";
+        const stopIdx = state.deliveryOrder?.indexOf(k.namn);
+        const badge   = stopIdx >= 0
+          ? `<span style="font-family:var(--mono);font-size:10px;font-weight:700;background:#f5f3ef;color:#888;border-radius:3px;padding:1px 6px;flex-shrink:0">Stopp ${stopIdx + 1}</span>`
+          : "";
+        return `
+          <div class="kcard kl-row" data-kund="${sN}" style="display:flex;align-items:center;gap:8px;cursor:default;padding:8px 10px;">
+            <div class="kl-handle" style="cursor:grab;font-size:18px;color:#ccc;padding:4px 6px;touch-action:none;flex-shrink:0;user-select:none" title="Dra för att ändra leveransordning">⠿</div>
+            <div style="flex:1;min-width:0;cursor:pointer" onclick="openKundPanel(this.closest('.kl-row').dataset.kund)">
+              <div style="display:flex;align-items:baseline;gap:6px;flex-wrap:wrap">
+                <span style="font-weight:700;font-size:14px">${sN}</span>${knr}${badge}
+              </div>
+              ${aStr}${tStr}
+            </div>
+          </div>`;
+      }).join("")}
+    </div>`;
+
+  _initKundlistaDrag();
+}
+
+function _initKundlistaDrag() {
+  const list = document.getElementById("kundlista-drag-list");
+  if (!list) return;
+
+  let srcCard = null, floatClone = null, placeholder = null, startY = 0;
+  const cy = e => e.touches ? e.touches[0].clientY : e.clientY;
+
+  function onStart(e) {
+    if (!e.target.closest(".kl-handle")) return;
+    e.preventDefault();
+    srcCard = e.target.closest(".kl-row");
+    startY  = cy(e);
+    placeholder = document.createElement("div");
+    placeholder.style.cssText = `height:${srcCard.offsetHeight}px;background:#f5f3ef;border-radius:8px;margin-bottom:8px;border:1px dashed var(--border2)`;
+    srcCard.after(placeholder);
+    srcCard.style.opacity = "0.2";
+    const rect = srcCard.getBoundingClientRect();
+    floatClone = srcCard.cloneNode(true);
+    Object.assign(floatClone.style, {
+      position:"fixed", left:rect.left+"px", top:rect.top+"px",
+      width:rect.width+"px", zIndex:"9999", opacity:"0.92",
+      pointerEvents:"none", boxShadow:"0 8px 24px rgba(0,0,0,0.15)"
+    });
+    document.body.appendChild(floatClone);
+  }
+  function onMove(e) {
+    if (!floatClone) return;
+    e.preventDefault();
+    const y = cy(e);
+    floatClone.style.top = parseFloat(floatClone.style.top) + (y - startY) + "px";
+    startY = y;
+    const rows = [...list.querySelectorAll(".kl-row")].filter(r => r !== srcCard);
+    let placed = false;
+    for (const r of rows) {
+      const rect = r.getBoundingClientRect();
+      if (y < rect.top + rect.height / 2) { list.insertBefore(placeholder, r); placed = true; break; }
+    }
+    if (!placed) list.appendChild(placeholder);
+  }
+  function onEnd() {
+    if (!floatClone) return;
+    list.insertBefore(srcCard, placeholder);
+    placeholder.remove(); floatClone.remove();
+    srcCard.style.opacity = "";
+    srcCard = null; floatClone = null; placeholder = null;
+
+    // Persist the new delivery order
+    state.deliveryOrder = [...list.querySelectorAll(".kl-row")].map(r => r.dataset.kund);
+    persistState();
+    render(); // re-sort plocklista
+    _renderKundlista(); // update badges
+  }
+
+  list.addEventListener("mousedown",  onStart);
+  list.addEventListener("touchstart", onStart, { passive: false });
+  // Use local refs so we can clean them up when panel closes
+  list._klMoveHandler = onMove; list._klEndHandler = onEnd;
+  window.addEventListener("mousemove", onMove);
+  window.addEventListener("touchmove", onMove, { passive: false });
+  window.addEventListener("mouseup",   onEnd);
+  window.addEventListener("touchend",  onEnd);
+}
+
+function closeKundlista() {
+  // Remove drag listeners
+  const list = document.getElementById("kundlista-drag-list");
+  if (list?._klMoveHandler) {
+    window.removeEventListener("mousemove", list._klMoveHandler);
+    window.removeEventListener("touchmove", list._klMoveHandler);
+    window.removeEventListener("mouseup",   list._klEndHandler);
+    window.removeEventListener("touchend",  list._klEndHandler);
+  }
+  document.getElementById("kundlista-panel").classList.remove("open");
+}
+
+function openKundPanel(namn) {
+  const ki = (window._kundMap||{})[namn]||{};
+  const hasLev = ki.leveransAdress?.trim(), hasFak = ki.fakturaAdress?.trim();
+  const addr = hasLev || (hasFak?ki.fakturaAdress:"");
+  const isFak = !hasLev && hasFak;
+  const mUrl = addr ? `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(addr)}` : "";
+
+  // Orders for this customer
+  const orderMap = {};
+  for (const art of state.articles) for (const ref of art.orderRefs) {
+    if (ref.kund !== namn) continue;
+    if (!orderMap[ref.orderNr]) orderMap[ref.orderNr] = { orderNr: ref.orderNr, orderDate: ref.orderDate, items: [] };
+    orderMap[ref.orderNr].items.push({ artNr: art.artNr, beskrivning: art.beskrivning, enhet: art.enhet, antal: ref.antal });
+  }
+
+  const infoRows = [
+    ki.kundNr    ? `<div class="oinfo-row"><span class="oinfo-label">Kundnr</span><span style="font-family:var(--mono);font-weight:700">${escHtml(ki.kundNr)}</span></div>` : "",
+    addr         ? `<div class="oinfo-row"><span class="oinfo-label">Adress</span><span>${isFak?'<span class="oinfo-warn">FAKTURAADRESS &nbsp;</span>':""}<a href="${escHtml(mUrl)}" target="_blank" class="addr-link">${escHtml(addr)}</a></span></div>` : "",
+    ki.telefon   ? `<div class="oinfo-row"><span class="oinfo-label">Telefon</span><span><a href="tel:${escHtml(ki.telefon)}" style="font-size:15px;font-weight:600;color:var(--text);text-decoration:none">${escHtml(ki.telefon)}</a></span></div>` : "",
+    ki.referens  ? `<div class="oinfo-row"><span class="oinfo-label">Referens</span><span>${escHtml(ki.referens)}</span></div>` : "",
+    ki.senasteLeverans ? `<div class="oinfo-row"><span class="oinfo-label">Senast</span><span class="oinfo-senast">${escHtml(ki.senasteLeverans)}</span></div>` : "",
+    ki.orderDates?.length    ? `<div class="oinfo-row"><span class="oinfo-label">Orderdatum</span><span class="oinfo-date">${ki.orderDates.sort().map(fmtDate).join(", ")}</span></div>` : "",
+    ki.leveransDates?.length ? `<div class="oinfo-row"><span class="oinfo-label">Leveransdatum</span><span class="oinfo-date oinfo-levdate">${ki.leveransDates.sort().map(fmtDate).join(", ")}</span></div>` : "",
+  ].filter(Boolean).join("");
+
+  const ordersHtml = Object.values(orderMap).length ? `
+    <div style="font-family:var(--mono);font-size:10px;font-weight:700;letter-spacing:0.1em;color:var(--muted);text-transform:uppercase;margin:14px 0 6px">ORDRAR</div>
+    ${Object.values(orderMap).map(o => `
+      <div style="border:1px solid var(--border);border-radius:6px;margin-bottom:6px;overflow:hidden">
+        <div style="background:#f5f3ef;padding:6px 10px;display:flex;justify-content:space-between">
+          <span style="font-family:var(--mono);font-weight:700;font-size:12px">Order #${escHtml(o.orderNr)}</span>
+          ${o.orderDate ? `<span class="oinfo-date">${fmtDate(o.orderDate)}</span>` : ""}
+        </div>
+        <table style="width:100%;border-collapse:collapse;font-size:12px">
+          ${o.items.map(it => `<tr>
+            <td style="padding:5px 10px;border-bottom:1px solid var(--border);font-family:var(--mono);font-size:10px;color:var(--muted);width:50px">${escHtml(it.artNr)}</td>
+            <td style="padding:5px 6px;border-bottom:1px solid var(--border)">${escHtml(it.beskrivning)}</td>
+            <td style="padding:5px 10px;border-bottom:1px solid var(--border);font-family:var(--mono);font-weight:700;text-align:right;white-space:nowrap">${formatAntal(it.antal)} ${escHtml(it.enhet)}</td>
+          </tr>`).join("")}
+        </table>
+      </div>`).join("")}` : "";
+
+  document.getElementById("kund-panel-title").textContent = namn;
+  document.getElementById("kund-panel-body").innerHTML =
+    `<div class="ocard-info">${infoRows || '<span style="color:var(--muted);font-size:13px">Inga kontaktuppgifter importerade.</span>'}</div>${ordersHtml}`;
+  document.getElementById("kund-panel").classList.add("open");
+}
+function closeKundPanel() { document.getElementById("kund-panel").classList.remove("open"); }
+
+/* ══════════════════════════════════════════════════════════════
+   §12 — ORDERPANEL
+   ══════════════════════════════════════════════════════════════ */
+function openOrderPanel(orderNr, kund) {
+  const items = []; let orderDate = "", leveransDatum = "";
+  for (const art of state.articles) for (const ref of art.orderRefs) {
+    if (ref.orderNr !== orderNr || ref.kund !== kund) continue;
+    items.push({ artNr: art.artNr, beskrivning: art.beskrivning, enhet: art.enhet, antal: ref.antal });
+    if (ref.orderDate    && !orderDate)     orderDate     = ref.orderDate;
+    if (ref.leveransDatum && !leveransDatum) leveransDatum = ref.leveransDatum;
+  }
+  const ki = (window._kundMap||{})[kund]||{};
+  const hasLev = ki.leveransAdress?.trim(), hasFak = ki.fakturaAdress?.trim();
+  const addr = hasLev || (hasFak?ki.fakturaAdress:"");
+  const isFak = !hasLev && hasFak;
+  const mUrl = addr ? `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(addr)}` : "";
+  const infoRows = [
+    addr   ? `<div class="oinfo-row"><span class="oinfo-label">Adress</span><span>${isFak?'<span class="oinfo-warn">FAKTURAADRESS &nbsp;</span>':""}<a href="${escHtml(mUrl)}" target="_blank" class="addr-link">${escHtml(addr)}</a></span></div>` : "",
+    ki.kundNr  ? `<div class="oinfo-row"><span class="oinfo-label">Kundnr</span><span style="font-family:var(--mono);font-weight:700">${escHtml(ki.kundNr)}</span></div>` : "",
+    ki.telefon ? `<div class="oinfo-row"><span class="oinfo-label">Telefon</span><span><a href="tel:${escHtml(ki.telefon)}" style="font-size:15px;font-weight:600;color:var(--text);text-decoration:none">${escHtml(ki.telefon)}</a></span></div>` : "",
+    ki.referens ? `<div class="oinfo-row"><span class="oinfo-label">Referens</span><span>${escHtml(ki.referens)}</span></div>` : "",
+    orderDate     ? `<div class="oinfo-row"><span class="oinfo-label">Orderdatum</span><span class="oinfo-date">${fmtDate(orderDate)}</span></div>` : "",
+    leveransDatum ? `<div class="oinfo-row"><span class="oinfo-label">Leveransdatum</span><span class="oinfo-date oinfo-levdate">${fmtDate(leveransDatum)}</span></div>` : "",
+    ki.senasteLeverans ? `<div class="oinfo-row"><span class="oinfo-label">Senast</span><span class="oinfo-senast">${escHtml(ki.senasteLeverans)}</span></div>` : "",
+  ].filter(Boolean).join("") || `<div style="color:var(--muted);font-size:12px;padding:4px 0">Inga kontaktuppgifter — lägg till via CSV.</div>`;
+  const sK = escHtml(kund);
+  document.getElementById("order-panel-title").textContent = `ORDER #${orderNr}`;
+  document.getElementById("order-panel-body").innerHTML = `
+    <div class="ocard-kundnamn" style="cursor:pointer;text-decoration:underline dotted" data-kund="${sK}" onclick="closeOrderPanel();openKundPanel(this.dataset.kund)">${sK}</div>
+    <div class="ocard-info">${infoRows}</div>
+    <table class="ocard-table">
+      <thead><tr><th>ArtNr</th><th>Artikel</th><th style="text-align:right">Antal</th></tr></thead>
+      <tbody>${items.map(it => `<tr><td class="td-nr">${escHtml(it.artNr)}</td><td>${escHtml(it.beskrivning)}</td><td class="td-qty">${formatAntal(it.antal)} ${escHtml(it.enhet)}</td></tr>`).join("")}</tbody>
+    </table>`;
+  document.getElementById("order-panel").classList.add("open");
+}
+function closeOrderPanel() { document.getElementById("order-panel").classList.remove("open"); }
+
+/* ══════════════════════════════════════════════════════════════
+   §13 — UTSKRIFT
+   ══════════════════════════════════════════════════════════════ */
+function haversine(lat1, lon1, lat2, lon2) {
+  const R = 6371, dLat = (lat2-lat1)*Math.PI/180, dLon = (lon2-lon1)*Math.PI/180;
+  const a = Math.sin(dLat/2)**2 + Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLon/2)**2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
+async function geocodeAddress(addr) {
+  if (!addr) return null;
+  const key = "geo_"+addr;
+  try { const c = sessionStorage.getItem(key); if (c) return JSON.parse(c); } catch(e) {}
+  try {
+    const r = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(addr)}&limit=1`, { headers:{ "Accept-Language":"sv" } });
+    const d = await r.json();
+    if (d?.[0]) { const co = { lat: +d[0].lat, lon: +d[0].lon }; try { sessionStorage.setItem(key, JSON.stringify(co)); } catch(e) {} return co; }
+  } catch(e) {}
+  return null;
+}
+
+async function renderPrintKombinerad() {
+  const el = document.getElementById("print-kombinerad");
+  if (!el) return;
+  let kunder = getUniqueCustomers();
+  if (!kunder.length) { el.innerHTML = ""; return; }
+
+  kunder.sort((a,b) => (a.senasteLeverans||"99:99").localeCompare(b.senasteLeverans||"99:99"));
+  try {
+    const coords = await Promise.all(kunder.map(k => geocodeAddress(k.leveransAdress||k.fakturaAdress)));
+    kunder = kunder.map((k,i) => ({ ...k, _dist: coords[i] ? haversine(HUB_LAT,HUB_LON,coords[i].lat,coords[i].lon) : 9999 }))
+      .sort((a,b) => { const ta=a.senasteLeverans||"99:99", tb=b.senasteLeverans||"99:99"; return ta!==tb?ta.localeCompare(tb):a._dist-b._dist; });
+  } catch(e) {}
+
+  const kundArtMap = {};
+  for (const art of state.articles) for (const ref of art.orderRefs) {
+    if (!kundArtMap[ref.kund]) kundArtMap[ref.kund] = [];
+    const ex = kundArtMap[ref.kund].find(r => r.artNr===art.artNr);
+    if (ex) ex.antal += ref.antal;
+    else kundArtMap[ref.kund].push({ artNr: art.artNr, beskrivning: art.beskrivning, enhet: art.enhet, antal: ref.antal });
+  }
+
+  const kundBlocks = kunder.map(k => {
+    const ki = (window._kundMap||{})[k.namn]||{};
+    const addr = ki.leveransAdress?.trim() || ki.fakturaAdress?.trim() || "";
+    const isFak = !ki.leveransAdress?.trim() && ki.fakturaAdress?.trim();
+    const mUrl  = addr ? `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(addr)}` : "";
+    const meta  = [ addr?`${isFak?"FAKTURAADRESS: ":""}<a href="${escHtml(mUrl)}" target="_blank">${addr}</a>`:"", ki.telefon||"", ki.referens||"", ki.kundNr?`Kundnr: ${ki.kundNr}`:"", ki.orderDates?.length?`Orderdatum: ${ki.orderDates.sort().map(fmtDate).join(", ")}`:"", ki.leveransDates?.length?`Leverans: ${ki.leveransDates.sort().map(fmtDate).join(", ")}`:"", k.senasteLeverans?`Senast: ${k.senasteLeverans}`:"" ].filter(Boolean);
+    const artRows = (kundArtMap[k.namn]||[]).map(a => `<div class="pk-art-row"><span class="pk-art-nr">${escHtml(a.artNr)}</span><span class="pk-art-name">${escHtml(a.beskrivning)}</span><span class="pk-art-qty">${formatAntal(a.antal)}</span><span class="pk-art-unit">${escHtml(a.enhet)}</span></div>`).join("");
+    const kom = (state.kommentarer||{})[k.namn]||"";
+    return `<div class="print-kundblock"><div class="pk-header"><div class="pk-name">${escHtml(k.namn)}</div>${meta.length?`<div class="pk-meta">${meta.join(" &nbsp;·&nbsp; ")}</div>`:""}</div><div class="pk-articles">${artRows}</div><div class="pk-footer">${kom?`<div class="pk-kommentar">${escHtml(kom)}</div>`:""}<div class="pk-check"><div class="pk-check-item"><span class="pk-check-box"></span> Klar</div><div class="pk-check-item"><span class="pk-check-box"></span> Ej hemma</div><div class="pk-check-item"><span class="pk-check-box"></span> Anmärkning</div></div></div></div>`;
+  }).join("");
+
+  const plockRows = state.articles.map(a => `<div class="print-art-row"><span class="print-art-nr">${escHtml(a.artNr)}</span><span class="print-art-name">${escHtml(a.beskrivning)}</span><span class="print-art-total">${formatAntal(a.total)}</span><span class="print-art-unit">${escHtml(a.enhet)}</span></div>`).join("");
+
+  el.innerHTML = `<div class="print-grid">${kundBlocks}</div><div class="print-plocklista-header">PLOCKLISTA — TOTALT</div><div class="print-plocklista-grid">${plockRows}</div>`;
+}
+function renderPrintKundkort() { renderPrintKombinerad(); }
+
+/* ══════════════════════════════════════════════════════════════
+   §14 — IMPORT-FLÖDE
+   ══════════════════════════════════════════════════════════════ */
+function mergeIntoState(newArticles) {
+  const em = {};
+  state.articles.forEach(a => { em[a.artNr] = a; });
+  for (const art of newArticles) {
+    if (em[art.artNr]) {
+      em[art.artNr].total += art.total;
+      em[art.artNr].orderRefs.push(...art.orderRefs);
+      if (art.earliestDate && (!em[art.artNr].earliestDate || art.earliestDate < em[art.artNr].earliestDate)) em[art.artNr].earliestDate = art.earliestDate;
+    } else em[art.artNr] = art;
+  }
+  const nc = {};
+  Object.keys(state.checked).forEach(a => { if (em[a]) nc[a] = true; });
+  state = { ...state, articles: Object.values(em).sort((a,b) => parseInt(a.artNr)-parseInt(b.artNr)), checked: nc };
+}
+
+const showMessages  = msgs => { document.getElementById("msg-area").innerHTML = msgs.map(m => `<div class="msg msg-${m.type}">&#9888; ${escHtml(m.text)}</div>`).join(""); };
+const clearMessages = ()   => { document.getElementById("msg-area").innerHTML = ""; };
+
+function finalizeImport(newArticles, extraMessages=[]) {
+  const w = validateArticles(newArticles);
+  const warnMsgs = w.map(t => ({ type:"warn", text:t }));
+  const errMsgs  = extraMessages.filter(m => m.type === "err");
+  const allMsgs  = [...extraMessages, ...warnMsgs];
+
+  const t = newArticles.length;
+  const okMsg = { type:"ok", text:`${t} artikel${t !== 1 ? "er" : ""} importerad${t !== 1 ? "e" : ""}` };
+
+  // Visa alltid ett ok-meddelande om det inte finns blockerande fel
+  if (errMsgs.length) {
+    showMessages(allMsgs);
+  } else {
+    showMessages([okMsg, ...warnMsgs]);
+  }
+
+  const dates = newArticles.map(a => a.earliestDate).filter(Boolean).sort();
+  if (dates.length) {
+    const latest = dates[dates.length - 1];
+    if (!deliveryDate || latest > deliveryDate) {
+      deliveryDate = latest;
+      persistDate(); updateDateWarnings();
+    }
+  }
+  mergeIntoState(newArticles); persistState(); render();
+  setTimeout(() => document.getElementById("plocklista").scrollIntoView({ behavior:"smooth" }), 100);
+}
+
+function openPasteModal()  { document.getElementById("paste-modal").classList.add("open"); setTimeout(() => document.getElementById("paste-area").focus(), 50); }
+function closePasteModal() { document.getElementById("paste-modal").classList.remove("open"); }
+function importFromPaste() {
+  const text = document.getElementById("paste-area").value;
+  if (!text.trim()) { showMessages([{ type:"err", text:"Klistra in CSV-text i rutan ovan." }]); return; }
+  const { rows, errors } = parseCSV(text);
+  const errMsgs = errors.map(e => ({ type:"err", text:e }));
+  if (!rows.length) { showMessages(errMsgs.length ? errMsgs : [{ type:"err", text:"Inga giltiga rader hittades." }]); return; }
+  finalizeImport(aggregateRows(rows), errMsgs);
+  document.getElementById("paste-area").value = "";
+  closePasteModal();
+}
+
+function openKommentarModal(namn) {
+  window._kommentarKund = namn;
+  document.getElementById("kommentar-modal-title").textContent = namn;
+  document.getElementById("kommentar-textarea").value = (state.kommentarer||{})[namn]||"";
+  document.getElementById("kommentar-modal").classList.add("open");
+  setTimeout(() => document.getElementById("kommentar-textarea").focus(), 50);
+}
+function closeKommentarModal() { document.getElementById("kommentar-modal").classList.remove("open"); }
+function saveKommentar() {
+  if (!state.kommentarer) state.kommentarer = {};
+  const txt = document.getElementById("kommentar-textarea").value.trim();
+  const k = window._kommentarKund;
+  txt ? state.kommentarer[k] = txt : delete state.kommentarer[k];
+  persistState(); closeKommentarModal(); render();
+}
+
+function onDragOver(e, id)   { e.preventDefault(); document.getElementById(id).classList.add("drag"); }
+function onDragLeave(e, id)  { document.getElementById(id).classList.remove("drag"); }
+function onUnifiedDrop(e)    { e.preventDefault(); document.getElementById("unified-zone").classList.remove("drag"); processFiles([...e.dataTransfer.files]); }
+function onUnifiedFileSelect(e) { processFiles([...e.target.files]); e.target.value = ""; }
+
+async function processFiles(files) {
+  if (!files.length) return;
+  const jsonFiles = files.filter(f => /\.json$/i.test(f.name));
+  const csvFiles  = files.filter(f => /\.(csv|txt)$/i.test(f.name));
+  const pdfFiles  = files.filter(f => /\.pdf$/i.test(f.name));
+
+  // JSON backup — handle separately (full state restore, not article merge)
+  if (jsonFiles.length) {
+    if (jsonFiles.length === 1) {
+      await _importBackupFile(jsonFiles[0]);
+    } else {
+      showMessages([{ type:"err", text:"Kan bara importera en JSON-backup åt gången." }]);
+    }
+    // If only JSON files were dropped, stop here
+    if (!csvFiles.length && !pdfFiles.length) return;
+  }
+
+  const allRows = [], allErrors = [];
+  const zone = document.getElementById("unified-zone-title");
+  const stat = document.getElementById("pdf-status");
+  zone.textContent = "Läser…"; stat.className = "show"; stat.textContent = "";
+
+  for (const f of csvFiles) {
+    try {
+      const { rows, errors } = parseCSV(await readFileAsText(f));
+      allRows.push(...rows);
+      allErrors.push(...errors.map(e => ({ type:"err", text:`${f.name}: ${e}` })));
+    } catch(e) { allErrors.push({ type:"err", text:`${f.name}: ${e.message}` }); }
+  }
+  if (pdfFiles.length) {
+    try {
+      const lib = await loadPdfJs();
+      for (let i = 0; i < pdfFiles.length; i++) {
+        const f = pdfFiles[i];
+        stat.textContent = `Läser PDF ${i + 1}/${pdfFiles.length}: ${f.name}…`;
+        try {
+          const rows = await parsePDFFile(f, lib);
+          allRows.push(...rows);
+          if (!rows.length) allErrors.push({ type:"warn", text:`${f.name}: Inga artiklar hittades.` });
+        } catch(e) { allErrors.push({ type:"err", text:`${f.name}: ${e.message}` }); }
+      }
+    } catch(e) { allErrors.push({ type:"err", text: e.message }); }
+  }
+  zone.textContent = files.length === 1 ? files[0].name : `${files.length} filer`;
+  stat.className = ""; stat.textContent = "";
+  if (!allRows.length) {
+    showMessages(allErrors.length ? allErrors : [{ type:"err", text:"Inga giltiga rader hittades." }]);
+    return;
+  }
+  finalizeImport(aggregateRows(allRows), allErrors);
+}
+
+// Importera JSON-backup via drag/drop eller filval
+async function _importBackupFile(file) {
+  const zone = document.getElementById("unified-zone-title");
+  const stat = document.getElementById("pdf-status");
+  zone.textContent = "Läser backup…"; stat.className = "show"; stat.textContent = file.name;
+  try {
+    const text = await readFileAsText(file);
+    const data = JSON.parse(text);
+    if (!data.state?.articles) throw new Error("Ogiltigt format — saknar articles-fält.");
+    state = {
+      articles: [], checked: {}, kommentarer: {},
+      deliveryOrder: [], weights: {}, chaufDone: {}, catOrder: [],
+      ...data.state
+    };
+    window._kundMap = data.kundMap || {};
+    if (data.catMap) { window._catMap = data.catMap; localStorage.setItem(SK_CATMAP, JSON.stringify(data.catMap)); }
+    if (data.deliveryDate) { deliveryDate = data.deliveryDate; persistDate(); }
+    persistState(); render();
+    zone.textContent = file.name;
+    stat.className = ""; stat.textContent = "";
+    const t = state.articles.length;
+    showMessages([{ type:"ok", text:`Backup importerad: ${t} artikel${t !== 1 ? "er" : ""}` }]);
+  } catch(e) {
+    zone.textContent = "Importera CSV, PDF eller JSON";
+    stat.className = ""; stat.textContent = "";
+    showMessages([{ type:"err", text:`Backup-fel: ${e.message}` }]);
+  }
+}
+
+const readFileAsText = file => new Promise((res, rej) => { const r = new FileReader(); r.onload = e => res(e.target.result); r.onerror = () => rej(new Error("Kunde inte läsa filen.")); r.readAsText(file, "utf-8"); });
+
+function exportBackup() {
+  const b = { version:6, exported: new Date().toISOString(), state, kundMap: window._kundMap||{}, catMap: window._catMap||{}, deliveryDate };
+  const a = Object.assign(document.createElement("a"), { href: URL.createObjectURL(new Blob([JSON.stringify(b,null,2)],{type:"application/json"})), download: `plockflow-${deliveryDate||todayISO()}.json` });
+  a.click(); URL.revokeObjectURL(a.href);
+}
+function importBackup(event) {
+  const file = event.target.files[0]; if (!file) return;
+  const r = new FileReader();
+  r.onload = ev => {
+    try {
+      const data = JSON.parse(ev.target.result);
+      if (!data.state?.articles) throw new Error("Ogiltigt format — saknar articles-fält.");
+      state = {
+        articles:      [],
+        checked:       {},
+        kommentarer:   {},
+        deliveryOrder: [],
+        weights:       {},
+        chaufDone:     {},
+        catOrder:      [],
+        ...data.state
+      };
+      window._kundMap = data.kundMap || {};
+      if (data.deliveryDate) { deliveryDate = data.deliveryDate; persistDate(); }
+      persistState(); render();
+      const t = state.articles.length;
+      showMessages([{ type:"ok", text:`Backup importerad: ${t} artikel${t !== 1 ? "er" : ""}` }]);
+    } catch(e) { showMessages([{ type:"err", text:`Backup-fel: ${e.message}` }]); }
+  };
+  r.readAsText(file, "utf-8"); event.target.value = "";
+}
+
+function clearAll() {
+  if (!confirm("Rensa hela plocklistan? Det går inte att ångra.")) return;
+  state = { articles:[], checked:{}, kommentarer:{}, deliveryOrder:[], weights:{}, chaufDone:{}, catOrder:[] };
+  window._kundMap = {};
+  chaufState.geoCache = {};
+  persistState(); clearMessages();
+  document.getElementById("unified-zone-title").textContent = "Importera CSV, PDF eller JSON";
+  document.getElementById("pdf-status").className = "";
+  document.getElementById("pdf-status").textContent = "";
+  render();
+}
+
+/* ══════════════════════════════════════════════════════════════
+   §15 — CHAUFFÖRSVY
+   Driver-safe: WakeLock · large targets · 1-tap actions
+   ══════════════════════════════════════════════════════════════ */
+
+// ── Smart navigation URL ──────────────────────────────────────
+// Priority: Waze (if installed, via waze:// scheme) → Apple Maps (iOS)
+// → Google Maps. Browser can't detect app installation, so we use
+// universal links: waze:// on mobile which auto-falls-back; on desktop
+// we just open Google Maps.
+function _navUrl(addr) {
+  if (!addr) return "#";
+  const enc = encodeURIComponent(addr);
+  const ua  = navigator.userAgent || "";
+  const isIOS     = /iPad|iPhone|iPod/.test(ua);
+  const isAndroid = /Android/.test(ua);
+
+  if (isIOS) {
+    // Waze universal link (opens Waze if installed, App Store otherwise)
+    return `https://waze.com/ul?q=${enc}&navigate=yes`;
+  }
+  if (isAndroid) {
+    // Waze intent — falls back to web Waze if not installed
+    return `https://waze.com/ul?q=${enc}&navigate=yes`;
+  }
+  // Desktop: Google Maps
+  return `https://www.google.com/maps/search/?api=1&query=${enc}`;
+}
+
+// ── Wake Lock ─────────────────────────────────────────────────
+let _wakeLock = null;
+
+async function acquireWakeLock() {
+  if (!("wakeLock" in navigator)) return;
+  try {
+    _wakeLock = await navigator.wakeLock.request("screen");
+    _wakeLock.addEventListener("release", () => { _wakeLock = null; _updateWakeLockBtn(); });
+    _updateWakeLockBtn();
+  } catch(e) { console.warn("WakeLock:", e.message); }
+}
+
+async function releaseWakeLock() {
+  if (_wakeLock) { await _wakeLock.release(); _wakeLock = null; }
+  _updateWakeLockBtn();
+}
+
+async function toggleWakeLock() {
+  _wakeLock ? await releaseWakeLock() : await acquireWakeLock();
+}
+
+function _updateWakeLockBtn() {
+  const active = !!_wakeLock;
+  // Chauffeur button
+  const cd = document.getElementById("cd-wakelock-btn");
+  if (cd) {
+    cd.classList.toggle("active", active);
+    cd.title = active ? "Skärm låst på — tryck för att stänga av" : "Håll skärmen tänd";
+  }
+  // Main topbar button
+  const main = document.getElementById("btn-wakelock");
+  if (main) {
+    main.classList.toggle("tbtn-w", !active);
+    main.classList.toggle("tbtn-g", active);
+    main.title = active ? "Skärm låst på — tryck för att stänga av" : "Håll skärmen tänd";
+  }
+}
+
+// Re-acquire on visibility change — always on
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && !_wakeLock) acquireWakeLock();
+});
+
+// ── Open / Close ──────────────────────────────────────────────
+function openChauffor() {
+  document.getElementById("chauf-panel").classList.add("open");
+  document.body.style.overflow = "hidden";
+  acquireWakeLock();
+
+  const allCustomers = getUniqueCustomers().map(k => k.namn);
+  if (!allCustomers.length) { renderChaufList(); return; }
+
+  if (state.deliveryOrder && state.deliveryOrder.length > 0) {
+    // Synka eventuella nya kunder som ännu inte finns i körordningen
+    const known  = new Set(state.deliveryOrder);
+    const newOnes = allCustomers.filter(n => !known.has(n));
+    if (newOnes.length) state.deliveryOrder.push(...newOnes);
+    // Ta bort kunder ur körordningen som inte längre finns
+    state.deliveryOrder = state.deliveryOrder.filter(n => allCustomers.includes(n));
+    renderChaufList();
+  } else {
+    chaufResort();
+  }
+}
+
+function closeChauffor() {
+  document.getElementById("chauf-panel").classList.remove("open");
+  document.body.style.overflow = "";
+}
+
+// ── Autosort: senast-leverans → distance from HUB ────────────
+async function chaufResort() {
+  // Show spinner overlay
+  const overlay = document.getElementById("cd-sorting-overlay");
+  overlay.classList.add("show");
+
+  let kunder = getUniqueCustomers();
+
+  // Geocode missing addresses in parallel
+  await Promise.all(kunder.map(async k => {
+    if (chaufState.geoCache[k.namn] !== undefined) return;
+    const addr = k.leveransAdress || k.fakturaAdress || "";
+    chaufState.geoCache[k.namn] = addr ? await geocodeAddress(addr) : null;
+  }));
+
+  chaufState.order = kunder.map(k => ({
+    ...k,
+    _dist: chaufState.geoCache[k.namn]
+      ? haversine(HUB_LAT, HUB_LON, chaufState.geoCache[k.namn].lat, chaufState.geoCache[k.namn].lon)
+      : 9999,
+  })).sort((a,b) => {
+    const ta = a.senasteLeverans || "99:99", tb = b.senasteLeverans || "99:99";
+    return ta !== tb ? ta.localeCompare(tb) : a._dist - b._dist;
+  }).map(k => k.namn);
+
+  overlay.classList.remove("show");
+  renderChaufList();
+}
+
+// ── Done toggle ───────────────────────────────────────────────
+function toggleChaufDone(namn) {
+  chaufState.done[namn] = !chaufState.done[namn];
+  // Update just this card — no full re-render (fast, no scroll jump)
+  const card = document.querySelector(`[data-cd-namn="${CSS.escape(namn)}"]`);
+  if (card) _updateCardDoneState(card, namn);
+  _updateChaufHeader();
+  persistState(); // spara chaufDone-status
+}
+
+function _updateCardDoneState(card, namn) {
+  const isDone = !!chaufState.done[namn];
+  card.classList.toggle("done", isDone);
+  const levererad = card.querySelector(".cd-levererad");
+  if (levererad) levererad.style.display = isDone ? "block" : "none";
+  const btn = card.querySelector(".cd-done-btn");
+  if (btn) btn.textContent = isDone ? "↩ Markera ej klar" : "✓ LEVERERAD";
+}
+
+function _updateChaufHeader() {
+  const total = chaufState.order.length;
+  const done  = chaufState.order.filter(n => chaufState.done[n]).length;
+  const pct   = total ? (done / total) * 100 : 0;
+
+  document.getElementById("cd-counter").innerHTML =
+    `${done} <span>/ ${total}</span>`;
+  document.getElementById("cd-progress-fill").style.width = pct + "%";
+  document.getElementById("cd-empty").classList.toggle("show", total === 0);
+}
+
+// ── Render stop list ──────────────────────────────────────────
+function renderChaufList() {
+  const km  = window._kundMap || {};
+  const list = document.getElementById("cd-list");
+
+  // Build per-customer article/order maps
+  const artMap = {}, orderMap = {};
+  for (const art of state.articles) {
+    for (const ref of art.orderRefs) {
+      if (!artMap[ref.kund])   artMap[ref.kund]   = [];
+      if (!orderMap[ref.kund]) orderMap[ref.kund] = {};
+      const ex = artMap[ref.kund].find(r => r.artNr === art.artNr);
+      ex ? ex.antal += ref.antal : artMap[ref.kund].push({ artNr: art.artNr, beskrivning: art.beskrivning, enhet: art.enhet, antal: ref.antal });
+      if (!orderMap[ref.kund][ref.orderNr]) orderMap[ref.kund][ref.orderNr] = ref.leveransDatum || "";
+    }
+  }
+
+  list.innerHTML = "";
+
+  chaufState.order.forEach((namn, idx) => {
+    const ki     = km[namn] || {};
+    const hasLev = ki.leveransAdress?.trim();
+    const hasFak = ki.fakturaAdress?.trim();
+    const addr   = hasLev || (hasFak ? ki.fakturaAdress : "");
+    const isFak  = !hasLev && hasFak;
+    const isDone = !!chaufState.done[namn];
+    const kom    = (state.kommentarer || {})[namn] || "";
+    const orderNrs = Object.keys(orderMap[namn] || {}).join(", ");
+    const itemCount = (artMap[namn] || []).length;
+
+    // Decide which action buttons to show
+    const hasAddr  = !!addr;
+    const hasTel   = !!ki.telefon;
+
+    let actionClass = "";
+    if (!hasAddr && !hasTel)      actionClass = "only-unload";
+    else if (!hasAddr || !hasTel) actionClass = "no-phone";
+
+    const navBtn = hasAddr ? `
+      <a href="${escHtml(_navUrl(addr))}" target="_blank" class="cd-btn cd-btn-nav">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5c-1.38 0-2.5-1.12-2.5-2.5s1.12-2.5 2.5-2.5 2.5 1.12 2.5 2.5-1.12 2.5-2.5 2.5z"/></svg>
+        NAVIGERA
+      </a>` : "";
+
+    const telBtn = hasTel ? `
+      <a href="tel:${escHtml(ki.telefon)}" class="cd-btn cd-btn-phone">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M6.6 10.8c1.4 2.8 3.8 5.1 6.6 6.6l2.2-2.2c.3-.3.7-.4 1-.2 1.1.4 2.3.6 3.6.6.6 0 1 .4 1 1V20c0 .6-.4 1-1 1-9.4 0-17-7.6-17-17 0-.6.4-1 1-1h3.5c.6 0 1 .4 1 1 0 1.3.2 2.5.6 3.6.1.3 0 .7-.2 1L6.6 10.8z"/></svg>
+        RING
+      </a>` : "";
+
+    const unloadBtn = `
+      <button class="cd-btn cd-btn-unload" data-unload-namn="${escHtml(namn)}" onclick="openUnloadPanel(this.dataset.unloadNamn)">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 7H4a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2z"/><path d="M12 12v4M8 12l4 4 4-4"/></svg>
+        AVLASTA
+      </button>`;
+
+    const card = document.createElement("div");
+    card.className = "cd-card" + (isDone ? " done" : "");
+    card.dataset.cdNamn = namn;
+
+    card.innerHTML = `
+      <div class="cd-inner">
+
+        <!-- Draghandtag + stoppnummer -->
+        <div class="cd-handle" title="Hall och dra">
+          <span class="cd-stopnr">${idx + 1}</span>
+          <div class="cd-drag-dots">
+            <span></span><span></span><span></span><span></span><span></span><span></span>
+          </div>
+        </div>
+
+        <!-- Kortinnehall -->
+        <div class="cd-body">
+
+          <!-- Kundnamn -->
+          <div class="cd-name">${escHtml(namn)}</div>
+
+          <!-- Tidsbadge + ordernr -->
+          <div class="cd-meta-row">
+            ${ki.senasteLeverans ? `<span class="cd-senast">&#9200; ${escHtml(ki.senasteLeverans)}</span>` : ""}
+            ${orderNrs ? `<span class="cd-order-ref">#${escHtml(orderNrs)}</span>` : ""}
+          </div>
+
+          <!-- Adress -->
+          ${addr ? `
+            ${isFak ? `<span class="cd-fak-warn">&#9888; FAKTURAADRESS</span>` : ""}
+            <div class="cd-addr">${escHtml(addr)}</div>
+          ` : `<div class="cd-no-addr">&#9888; Ingen adress</div>`}
+
+          <!-- Kommentar -->
+          ${kom ? `<div class="cd-comment">&#128172; ${escHtml(kom)}</div>` : ""}
+
+          <!-- Actionknappar: NAVIGERA · RING · AVLASTA -->
+          <div class="cd-action-row ${actionClass}">
+            ${navBtn}${telBtn}${unloadBtn}
+          </div>
+
+          <!-- Levererad-bekraftelse -->
+          <div class="cd-levererad">&#10003; Levererad</div>
+
+          <!-- Klar/ej klar -->
+          <button class="cd-done-btn" data-namn="${escHtml(namn)}"
+                  onclick="toggleChaufDone(this.dataset.namn)">
+            ${isDone ? "&#8629; Markera ej klar" : "&#10003; LEVERERAD"}
+          </button>
+
+        </div>
+      </div>`;
+
+    list.appendChild(card);
+  });
+
+  _updateChaufHeader();
+  _initChaufDrag();
+}
+
+// ── Avlastningsvy ─────────────────────────────────────────────
+let _unloadChecked = {}; // { namn: { artNr: true } }
+
+function openUnloadPanel(namn) {
+  const km = window._kundMap || {};
+  const ki = km[namn] || {};
+
+  // Bygg artikellista for kunden
+  const items = [];
+  for (const art of state.articles) {
+    for (const ref of art.orderRefs) {
+      if (ref.kund !== namn) continue;
+      const ex = items.find(i => i.artNr === art.artNr);
+      if (ex) { ex.antal += ref.antal; }
+      else items.push({ artNr: art.artNr, beskrivning: art.beskrivning, enhet: art.enhet, antal: ref.antal });
+    }
+  }
+
+  if (!_unloadChecked[namn]) _unloadChecked[namn] = {};
+  const checked = _unloadChecked[namn];
+
+  // Sortera med kategorier (anvand samma klassificering)
+  const catOrder = _getCatOrder();
+  items.sort((a, b) => {
+    const ca = _classifyArticle(a), cb = _classifyArticle(b);
+    const ia = catOrder.indexOf(ca.id), ib = catOrder.indexOf(cb.id);
+    if (ia !== ib) return ia - ib;
+    return parseInt(a.artNr) - parseInt(b.artNr);
+  });
+
+  const panel = document.getElementById("cd-unload-panel");
+  document.getElementById("cd-ul-title").textContent = namn;
+  document.getElementById("cd-ul-badge").textContent = items.length + " art";
+
+  const listEl = document.getElementById("cd-ul-list");
+  let html = "";
+  let lastCat = null;
+
+  for (const item of items) {
+    const cat = _classifyArticle(item);
+    if (cat.id !== lastCat) {
+      lastCat = cat.id;
+      html += `<div class="cd-ul-cat-divider">
+        <div class="cd-ul-cat-bar" style="background:${cat.color}"></div>
+        <span class="cd-ul-cat-label" style="color:${cat.color}">${cat.label}</span>
+        <div class="cd-ul-cat-line"></div>
+      </div>`;
+    }
+    const isChecked = !!checked[item.artNr];
+    const wKey = item.artNr + "|" + namn;
+    const w    = (state.weights || {})[wKey];
+    const qtyDisplay = (item.enhet.toLowerCase() === "kg" && w != null)
+      ? formatAntal(w) : formatAntal(item.antal);
+
+    html += `<div class="cd-ul-item${isChecked ? " checked" : ""}"
+              data-artnr="${escHtml(item.artNr)}"
+              data-namn="${escHtml(namn)}"
+              onclick="_toggleUnloadItem(this)">
+      <div class="cd-ul-chk">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#080808" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+      </div>
+      <div class="cd-ul-info">
+        <div class="cd-ul-name">${escHtml(item.beskrivning)}</div>
+        <div class="cd-ul-nr">${escHtml(item.artNr)}</div>
+      </div>
+      <div style="text-align:right;flex-shrink:0">
+        <div class="cd-ul-qty">${qtyDisplay}</div>
+        <div class="cd-ul-unit">${escHtml(item.enhet)}</div>
+      </div>
+    </div>`;
+  }
+
+  listEl.innerHTML = html;
+  panel.classList.add("open");
+  document.body.style.overflow = "hidden";
+}
+
+function _toggleUnloadItem(el) {
+  const artNr = el.dataset.artnr;
+  const namn  = el.dataset.namn;
+  if (!_unloadChecked[namn]) _unloadChecked[namn] = {};
+  _unloadChecked[namn][artNr] = !_unloadChecked[namn][artNr];
+  el.classList.toggle("checked", !!_unloadChecked[namn][artNr]);
+}
+
+function closeUnloadPanel() {
+  document.getElementById("cd-unload-panel").classList.remove("open");
+  // Återstall scroll bara om chaufpanelen ä öppen
+  if (!document.getElementById("chauf-panel").classList.contains("open")) {
+    document.body.style.overflow = "";
+  }
+}
+
+// ── Drag-to-reorder ───────────────────────────────────────────
+function _initChaufDrag() {
+  const list = document.getElementById("cd-list");
+  if (!list) return;
+
+  // Clean up previous global listeners before re-binding
+  if (window._cdDragHandlers) {
+    window.removeEventListener("mousemove", window._cdDragHandlers.move);
+    window.removeEventListener("touchmove", window._cdDragHandlers.move);
+    window.removeEventListener("mouseup",   window._cdDragHandlers.end);
+    window.removeEventListener("touchend",  window._cdDragHandlers.end);
+  }
+
+  let srcCard     = null;   // real card in the list (never moved)
+  let floatClone  = null;   // visual ghost that follows the finger
+  let placeholder = null;   // empty slot showing where card will land
+  let startY      = 0;
+
+  const cy = e => e.touches ? e.touches[0].clientY : e.clientY;
+
+  function onStart(e) {
+    if (!e.target.closest(".cd-handle")) return;
+    e.preventDefault();
+
+    srcCard = e.target.closest(".cd-card");
+    startY  = cy(e);
+
+    // 1. Placeholder keeps layout stable
+    placeholder = document.createElement("div");
+    placeholder.className = "cd-placeholder";
+    placeholder.style.height = srcCard.offsetHeight + "px";
+    srcCard.after(placeholder);
+
+    // 2. Visually hide real card in place (don't move it)
+    srcCard.style.opacity = "0.15";
+
+    // 3. Clone floats over everything
+    const rect = srcCard.getBoundingClientRect();
+    floatClone = srcCard.cloneNode(true);
+    Object.assign(floatClone.style, {
+      position:   "fixed",
+      left:       rect.left + "px",
+      top:        rect.top  + "px",
+      width:      rect.width + "px",
+      zIndex:     "9999",
+      opacity:    "0.9",
+      pointerEvents: "none",
+      borderColor:   "var(--cd-amber)",
+      boxShadow:  "0 14px 40px rgba(0,0,0,0.7)",
+      transition: "none",
+    });
+    document.body.appendChild(floatClone);
+  }
+
+  function onMove(e) {
+    if (!floatClone) return;
+    e.preventDefault();
+    const y = cy(e);
+    floatClone.style.top = (parseFloat(floatClone.style.top) + y - startY) + "px";
+    startY = y;
+
+    // Reposition placeholder between cards
+    const cards = [...list.querySelectorAll(".cd-card")].filter(c => c !== srcCard);
+    let placed = false;
+    for (const c of cards) {
+      const r = c.getBoundingClientRect();
+      if (y < r.top + r.height / 2) { list.insertBefore(placeholder, c); placed = true; break; }
+    }
+    if (!placed) list.appendChild(placeholder);
+  }
+
+  function onEnd() {
+    if (!floatClone) return;
+
+    // Drop real card at placeholder position, remove visual artifacts
+    list.insertBefore(srcCard, placeholder);
+    placeholder.remove();
+    floatClone.remove();
+    srcCard.style.opacity = "";
+
+    srcCard = null; floatClone = null; placeholder = null;
+
+    // Sync delivery order state from DOM
+    chaufState.order = [...list.querySelectorAll(".cd-card")].map(c => c.dataset.cdNamn);
+    list.querySelectorAll(".cd-stopnr").forEach((el, i) => { el.textContent = i + 1; });
+    // Also persist delivery order so plocklista reflects it
+    persistState();
+  }
+
+  list.addEventListener("mousedown",  onStart);
+  list.addEventListener("touchstart", onStart, { passive: false });
+
+  window._cdDragHandlers = { move: onMove, end: onEnd };
+  window.addEventListener("mousemove", onMove);
+  window.addEventListener("touchmove", onMove, { passive: false });
+  window.addEventListener("mouseup",   onEnd);
+  window.addEventListener("touchend",  onEnd);
+}
+
+
+
+/* ══════════════════════════════════════════════════════════════
+   §16 — SCROLL & TOPBAR
+   ══════════════════════════════════════════════════════════════ */
+let _lastScrollY = 0, _scrollTicking = false;
+window.addEventListener("scroll", () => {
+  if (_scrollTicking) return;
+  _scrollTicking = true;
+  requestAnimationFrame(() => {
+    const cy  = window.scrollY;
+    const bar = document.getElementById("topbar");
+    cy > _lastScrollY && cy > 80 ? bar.classList.add("hidden") : bar.classList.remove("hidden");
+    _lastScrollY = cy; _scrollTicking = false;
+  });
+}, { passive:true });
+
+
+/* ══════════════════════════════════════════════════════════════
+   §18b — KATEGORISORTERING
+   5 kategorier: TORRVAROR → FRYS FISK → KYL → FRYS KÖTT → ÖVRIGT
+   ══════════════════════════════════════════════════════════════ */
+
+const _CAT = {
+  TORR:      { id: "TORR",      label: "TORRVAROR", icon: "", color: "#92400e", bg: "#fffbeb", border: "#fcd34d" },
+  FRYS_FISK: { id: "FRYS_FISK", label: "FRYS FISK", icon: "", color: "#0369a1", bg: "#e0f2fe", border: "#7dd3fc" },
+  KYL:       { id: "KYL",       label: "KYL",        icon: "", color: "#0f766e", bg: "#f0fdfa", border: "#5eead4" },
+  FRYS_KOTT: { id: "FRYS_KOTT", label: "FRYS KÖTT",  icon: "", color: "#4338ca", bg: "#eef2ff", border: "#a5b4fc" },
+  OVRIG:     { id: "OVRIG",     label: "ÖVRIGT",     icon: "", color: "#6b7280", bg: "#f9fafb", border: "#d1d5db" },
+};
+// Standardordning: TORRVAROR → FRYS FISK → KYL → FRYS KÖTT → ÖVRIGT
+const _CAT_IDS_DEFAULT = ["TORR","FRYS_FISK","KYL","FRYS_KOTT","OVRIG"];
+
+function _renderCatStrip() {
+  const old = document.getElementById("_cat-strip");
+  if (old) old.remove();
+}
+
+function _getCatOrder() {
+  // catOrder must contain exactly our 5 IDs (all present) to be valid
+  const saved = state.catOrder || [];
+  const valid = _CAT_IDS_DEFAULT.every(id => saved.includes(id)) && saved.length === _CAT_IDS_DEFAULT.length;
+  return valid ? saved : [..._CAT_IDS_DEFAULT];
+}
+
+// ── Ordlistor ─────────────────────────────────────────────────
+const _FISH_WORDS = [
+  "lax","torsk","sej","rödspätta","kolja","sill","makrill","abborre","gädda","öring",
+  "regnbåge","röding","piggvar","hummer","räkor","räka","kräftor","kräfta","havskräfta",
+  "blåmussla","mussla","ostron","bläckfisk","tonfisk","sardiner","ansjovis","kaviar",
+  "löjrom","rom","fiskrom","sjötunga","tunga","kummel","pangasius","tilapia","lemon sole",
+  "halibut","helgeflundra","vitling","marulk","braxen","karp","ål","rökta","rökt fisk",
+  "gravlax","gravad","kallrökt","varmrökt","seafood","skaldjur","fisk","fiskfile",
+  "fiskfilé","fiskbullar","fiskpinnar","fiskgratäng","fiskfärs","surströmming","böckling",
+  "inlagd sill","silltartar","laxpaj","räkcocktail","scampi","pilgrimsmussla",
+];
+
+const _MEAT_WORDS = [
+  "nöt","nötfärs","nötkött","entrecote","ryggbiff","fransyska","innanlår","ytterlår",
+  "hjortfile","hjort","vildsvin","älg","rådjur","vilt","oxfile","oxfilé","oxkött",
+  "biff","biffstek","roastbeef","rostbiff","fläsk","fläskfile","fläskfilé","kotlett",
+  "karré","revbensspjäll","revben","sidfläsk","skinka","falukorv",
+  "korv","vurst","chorizo","salami","prosciutto","pancetta","bacon","bröstfile","bröst",
+  "kycklingfile","kyckling","kycklinglever","lever","njure","hjärta","märgpipa",
+  "fårkött","lamm","lammkotlett","lammfile","lammfilé","kalv","kalvfile","kalvfilé",
+  "kalvkött","kassler","lufttorkat","rensteak","ren","renfile",
+  "renkött","strutsfile","struts","hästkött","häst","griskött","gris",
+  "kött","köttfärs","köttbullar","hamburgare","burgare","stek",
+  "schnitzel","medallonger","tournedos","carpaccio","tartar",
+];
+
+const _FROZEN_WORDS = [
+  "fryst","frysvaror","djupfryst","glass","sorbet","gelato","fryspizza","fryspaj",
+  "frysta","frys","frozen","pommes","frites","haricots","edamame","ärtor","spenat",
+  "wok","wokgrönsaker","blåbär","hallon","jordgubbar","mango","bär","frukter frys",
+];
+
+const _DRY_WORDS = [
+  "mjöl","socker","salt","peppar","krydda","kryddor","buljong","fond","sås","ketchup",
+  "senap","majonnäs","olja","vinäger","honung","sylt","marmelad","pasta","spagetti",
+  "penne","makaroner","rigatoni","fusilli","ris","couscous","quinoa","bulgur","linser",
+  "bönor","kikärtor","konserver","burk","tetra","konserverad","torkad","chips","nötter",
+  "mandel","cashew","valnöt","jordnötter","russin","torkad frukt","müsli","havregryn",
+  "knäckebröd","skorpor","kex","kakor","choklad","kakao","kaffe","te","juice","läsk",
+  "vatten","mineralvatten","öl","vin","sprit","saft","syrup","torrvaror","kolonial",
+  "tomatpuré","tomatpure","passerade tomater","kokosmjölk","curry",
+  "chilisås","worcester","soja","tabasco","bakpulver","jäst","vanilj","kanel",
+];
+
+// Classify into exactly 5 categories
+function _classifyArticle(art) {
+  const manual = (window._catMap || {})[art.artNr];
+  if (manual && _CAT[manual]) return _CAT[manual];
+
+  const txt = (art.beskrivning + " " + (art.enhet||"")).toLowerCase()
+    .replace(/å/g,"a").replace(/ä/g,"a").replace(/ö/g,"o");
+
+  const match = (words) => words.some(w => {
+    const wn = w.replace(/å/g,"a").replace(/ä/g,"a").replace(/ö/g,"o");
+    return txt.includes(wn);
+  });
+
+  const isFrozen = match(_FROZEN_WORDS) || txt.includes("frys") || txt.includes("frost");
+  const isFish   = match(_FISH_WORDS);
+  const isMeat   = match(_MEAT_WORDS);
+  const isDry    = match(_DRY_WORDS);
+
+  // Frys fisk → FRYS_FISK
+  if (isFrozen && isFish)  return _CAT.FRYS_FISK;
+  // Frys kött → FRYS_KOTT
+  if (isFrozen && isMeat)  return _CAT.FRYS_KOTT;
+  // Övrig frys → KYL (kyl-hylla är närmast)
+  if (isFrozen)            return _CAT.FRYS_KOTT;
+  // Färsk fisk → KYL
+  if (isFish)              return _CAT.KYL;
+  // Kött → KYL
+  if (isMeat)              return _CAT.KYL;
+  // Torrvaror
+  if (isDry)               return _CAT.TORR;
+  return _CAT.OVRIG;
+}
+
+/* ══════════════════════════════════════════════════════════════
+   §17 — INITIALISERING
+   ══════════════════════════════════════════════════════════════ */
+(function init() {
+  loadPersistedData();
+  WARNING_DATE = todayISO();
+  render();
+  acquireWakeLock();
+  setTimeout(() => loadPdfJs().catch(()=>{}), 3000);
+})();
+
+
+
+/* ══════════════════════════════════════════════════════════════
+   §18c — KATEGORIORDNING MODAL
+   ══════════════════════════════════════════════════════════════ */
+let _catDragSrc = null;
+
+// ─── CATEGORY SYSTEM ─────────────────────────────────────────
+
+function _catSave() {
+  localStorage.setItem(SK_CATMAP, JSON.stringify(window._catMap || {}));
+}
+
+function _catJsonRefresh() {
+  const ta = document.getElementById("_cat-json-editor");
+  if (!ta) return;
+  ta.value = JSON.stringify(window._catMap || {}, null, 2);
+  document.getElementById("_cat-json-status").textContent = "";
+}
+
+function _catJsonLiveEdit(ta) {
+  const status = document.getElementById("_cat-json-status");
+  const raw = ta.value.trim();
+  if (!raw) {
+    window._catMap = {};
+    _catSave();
+    status.textContent = "✓ Rensad";
+    status.style.color = "var(--ok)";
+    _catListRefresh();
+    render();
+    return;
+  }
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch(e) {
+    status.textContent = "✗ " + e.message;
+    status.style.color = "var(--err)";
+    return;
+  }
+  const bad = Object.values(parsed).filter(v => !_CAT[v]);
+  if (bad.length) {
+    status.textContent = "✗ Okänt kategori-ID: " + [...new Set(bad)].join(", ");
+    status.style.color = "var(--err)";
+    return;
+  }
+  window._catMap = parsed;
+  _catSave();
+  const n = Object.keys(parsed).length;
+  status.textContent = "✓ " + n + " artiklar sparade";
+  status.style.color = "var(--ok)";
+  _catListRefresh();
+  render();
+}
+
+function _catJsonExport() {
+  const blob = new Blob([JSON.stringify(window._catMap || {}, null, 2)], {type:"application/json"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "plockflow-kategorier.json";
+  a.click();
+}
+
+function _catJsonImportFile(e) {
+  const file = e.target.files[0]; if (!file) return;
+  const reader = new FileReader();
+  reader.onload = ev => {
+    const ta = document.getElementById("_cat-json-editor");
+    ta.value = ev.target.result;
+    _catJsonLiveEdit(ta);
+  };
+  reader.readAsText(file);
+  e.target.value = "";
+}
+
+// Build the article list inside the modal
+function _catListRefresh() {
+  const el = document.getElementById("_cm-artlist");
+  if (!el) return;
+  const arts = (state.articles || []);
+  if (!arts.length) {
+    el.innerHTML = '<div style="padding:14px 12px;font-size:12px;color:var(--muted);font-family:var(--mono)">Ingen data inläst ännu</div>';
+    return;
+  }
+  el.innerHTML = arts.map(art => {
+    const cat = _classifyArticle(art);
+    const manual = !!(window._catMap || {})[art.artNr];
+    return `<div class="_cm-art-row" onclick="_pickCatInline(event,'${art.artNr}')" data-artnr="${art.artNr}">
+      <div style="width:4px;height:32px;border-radius:2px;background:${cat.color};flex-shrink:0"></div>
+      <div style="flex:1;min-width:0">
+        <div style="font-size:13px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(art.beskrivning)}</div>
+        <div style="font-family:var(--mono);font-size:10px;color:var(--muted);margin-top:2px">${escHtml(art.artNr)}</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:6px;flex-shrink:0">
+        <span style="font-family:var(--mono);font-size:11px;font-weight:800;color:${cat.color};${manual ? "text-decoration:underline dotted" : ""}">${cat.label}</span>
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#ccc" stroke-width="2.5"><polyline points="6 9 12 15 18 9"/></svg>
+      </div>
+    </div>`;
+  }).join("");
+}
+
+// Inline category picker inside the modal article list
+let _pickerArtNr = null;
+function _pickCatInline(e, artNr) {
+  e.stopPropagation();
+  _pickerArtNr = artNr;
+  document.querySelectorAll("._inline-cat-picker").forEach(el => el.remove());
+  const row = e.currentTarget;
+  const picker = document.createElement("div");
+  picker.className = "_inline-cat-picker";
+  picker.style.cssText = "background:#fff;border:1.5px solid var(--border2);border-radius:8px;padding:4px;margin:2px 0 4px 18px;display:flex;flex-wrap:wrap;gap:3px";
+  const currentCat = _classifyArticle((state.articles||[]).find(a=>a.artNr===artNr)||{artNr,beskrivning:""});
+
+  // Only show the 5 active categories + auto
+  _CAT_IDS_DEFAULT.forEach(catId => {
+    const cat = _CAT[catId];
+    const isActive = cat.id === currentCat.id;
+    const opt = document.createElement("button");
+    opt.style.cssText = `display:inline-flex;align-items:center;gap:4px;font-family:var(--mono);font-size:11px;font-weight:800;
+      color:${cat.color};background:${isActive ? cat.bg : "transparent"};
+      border:1.5px solid ${isActive ? cat.color : "transparent"};
+      border-radius:6px;padding:5px 10px;cursor:pointer;letter-spacing:.04em;transition:background .1s`;
+    opt.innerHTML = `${cat.label}`;
+    opt.onclick = ev => {
+      ev.stopPropagation();
+      if (!window._catMap) window._catMap = {};
+      window._catMap[artNr] = cat.id;
+      _catSave();
+      picker.remove();
+      _catListRefresh();
+      render();
+    };
+    picker.appendChild(opt);
+  });
+
+  // Auto button
+  const auto = document.createElement("button");
+  auto.style.cssText = "font-family:var(--mono);font-size:11px;font-weight:700;color:#aaa;background:transparent;border:1.5px solid #e5e2dc;border-radius:6px;padding:5px 10px;cursor:pointer";
+  auto.textContent = "↺ auto";
+  auto.onclick = ev => {
+    ev.stopPropagation();
+    if (window._catMap) delete window._catMap[artNr];
+    _catSave();
+    picker.remove();
+    _catListRefresh();
+    render();
+  };
+  picker.appendChild(auto);
+  row.after(picker);
+}
+
+// Floating picker triggered from the list dots
+function _openCatPicker(e, artNr) {
+  // Delegate to the modal's inline system — open modal on ARTIKELKARTA
+  openCatOrderModal();
+  // Scroll to and highlight that article
+  setTimeout(() => {
+    const rows = document.querySelectorAll("._cm-art-row");
+    const row = [...rows].find(r => r.dataset.artnr === artNr);
+    if (row) {
+      row.scrollIntoView({behavior:"smooth",block:"center"});
+      row.style.background = "#fefce8";
+      setTimeout(() => row.style.background = "", 800);
+      _pickCatInline({stopPropagation:()=>{},currentTarget:row}, artNr);
+    }
+  }, 80);
+}
+
+function openCatOrderModal() {
+  _catListRefresh();
+  const order = _getCatOrder();
+  const list = document.getElementById("cat-order-list");
+  list.innerHTML = "";
+  let _dragSrc = null;
+
+  order.forEach(catId => {
+    const cat = _CAT[catId];
+    if (!cat) return;
+    const row = document.createElement("div");
+    row.className = "cos-drag-row";
+    row.dataset.catId = catId;
+    row.innerHTML = `
+      <div class="cos-color-bar" style="background:${cat.color}"></div>
+      <span class="cos-drag-label" style="color:${cat.color}">${cat.label}</span>
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#ccc" stroke-width="2.5" stroke-linecap="round">
+        <line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/>
+      </svg>`;
+
+    row.draggable = true;
+    row.addEventListener("dragstart", e => {
+      _dragSrc = row; e.dataTransfer.effectAllowed = "move";
+      setTimeout(() => row.classList.add("dragging"), 0);
+    });
+    row.addEventListener("dragend", () => { row.classList.remove("dragging"); _dragSrc = null; });
+    row.addEventListener("dragover", e => e.preventDefault());
+    row.addEventListener("dragenter", e => { e.preventDefault(); if (row !== _dragSrc) row.style.borderColor = cat.color; });
+    row.addEventListener("dragleave", () => row.style.borderColor = "");
+    row.addEventListener("drop", e => {
+      e.preventDefault(); row.style.borderColor = "";
+      if (!_dragSrc || _dragSrc === row) return;
+      const items = [...list.querySelectorAll("[data-cat-id]")];
+      list.insertBefore(_dragSrc, items.indexOf(_dragSrc) < items.indexOf(row) ? row.nextSibling : row);
+    });
+
+    // Touch drag
+    let _ty = 0, _clone = null;
+    row.addEventListener("touchstart", e => {
+      _dragSrc = row; _ty = e.touches[0].clientY;
+      row.classList.add("dragging");
+      _clone = row.cloneNode(true);
+      const r = row.getBoundingClientRect();
+      Object.assign(_clone.style, { position:"fixed", left:r.left+"px", top:r.top+"px", width:r.width+"px", zIndex:"9999", pointerEvents:"none", boxShadow:"0 6px 24px rgba(0,0,0,.2)", opacity:"0.9" });
+      document.body.appendChild(_clone);
+    }, { passive: true });
+    row.addEventListener("touchmove", e => {
+      if (!_clone) return;
+      const dy = e.touches[0].clientY - _ty; _ty = e.touches[0].clientY;
+      _clone.style.top = (parseFloat(_clone.style.top) + dy) + "px";
+      const siblings = [...list.querySelectorAll("[data-cat-id]")].filter(r => r !== _dragSrc);
+      for (const r of siblings) {
+        const rb = r.getBoundingClientRect();
+        if (_ty < rb.top + rb.height / 2) { list.insertBefore(_dragSrc, r); return; }
+      }
+      list.appendChild(_dragSrc);
+    }, { passive: true });
+    row.addEventListener("touchend", () => {
+      row.classList.remove("dragging"); _clone?.remove(); _clone = null; _dragSrc = null;
+    });
+
+    list.appendChild(row);
+  });
+
+  document.getElementById("cat-order-modal").classList.add("open");
+}
+
+function closeCatOrderModal() {
+  document.querySelectorAll("._inline-cat-picker").forEach(el=>el.remove());
+  document.getElementById("cat-order-modal").classList.remove("open");
+}
+
+function saveCatOrder() {
+  const rows = document.querySelectorAll("#cat-order-list [data-cat-id]");
+  state.catOrder = [...rows].map(r => r.dataset.catId);
+  persistState();
+  render();
+  closeCatOrderModal();
+}
+
+function resetCatOrder() {
+  state.catOrder = [];
+  persistState();
+  render();
+  // Re-open to show new order
+  openCatOrderModal();
+}
+
+// Legacy stubs so nothing breaks
+function _catTab() {}
+function saveCatMap() {}
+function _catmapRefreshEditor() {}
+function _catmapExport() { _catJsonExport(); }
+function _catmapImportFile(e) { _catJsonImportFile(e); }
+function _catmapClear() {
+  if (!confirm("Rensa artikelkartan?")) return;
+  window._catMap = {};
+  _catSave();
+  _catJsonRefresh();
+  _catListRefresh();
+  render();
+}
+
+/* ══════════════════════════════════════════════════════════════
+   §18 — HASH-BASED SHARING (Standalone)
+   ══════════════════════════════════════════════════════════════
+   State encoding: JSON → UTF-8 → deflate → base64url → #share=...
+   Falls back to plain base64 if CompressionStream unavailable.
+   ══════════════════════════════════════════════════════════════ */
+
+// ── Compression helpers ──────────────────────────────────────
+async function _compress(str) {
+  const bytes = new TextEncoder().encode(str);
+  if (typeof CompressionStream !== "undefined") {
+    const cs = new CompressionStream("deflate-raw");
+    const writer = cs.writable.getWriter();
+    writer.write(bytes); writer.close();
+    const buf = await new Response(cs.readable).arrayBuffer();
+    return new Uint8Array(buf);
+  }
+  return bytes; // fallback: uncompressed
+}
+
+async function _decompress(buf, compressed) {
+  if (compressed && typeof DecompressionStream !== "undefined") {
+    const ds = new DecompressionStream("deflate-raw");
+    const writer = ds.writable.getWriter();
+    writer.write(buf); writer.close();
+    const out = await new Response(ds.readable).arrayBuffer();
+    return new TextDecoder().decode(out);
+  }
+  return new TextDecoder().decode(buf);
+}
+
+function _toBase64url(bytes) {
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+}
+
+function _fromBase64url(s) {
+  const b64 = s.replace(/-/g, "+").replace(/_/g, "/");
+  const bin = atob(b64 + "==".slice((b64.length + 3) & 3));
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+// ── Encode full state to URL-safe string ─────────────────────
+async function _encodeState() {
+  const payload = JSON.stringify({
+    v: 6,
+    state,
+    kundMap: window._kundMap || {},
+    catMap: window._catMap || {},
+    deliveryDate,
+    c: 1, // compressed flag
+  });
+  const compressed = await _compress(payload);
+  return "1:" + _toBase64url(compressed); // "1:" = version prefix
+}
+
+// ── Decode from URL string ───────────────────────────────────
+async function _decodeState(encoded) {
+  try {
+    const [ver, data] = encoded.split(":");
+    const bytes = _fromBase64url(data || encoded);
+    const json = await _decompress(bytes, ver === "1");
+    return JSON.parse(json);
+  } catch (e) {
+    return null;
+  }
+}
+
+// ── Share modal ───────────────────────────────────────────────
+function _buildShareModal() {
+  const existing = document.getElementById("_share-modal");
+  if (existing) existing.remove();
+
+  const overlay = document.createElement("div");
+  overlay.id = "_share-modal";
+  overlay.style.cssText = [
+    "display:none","position:fixed","inset:0","z-index:600",
+    "background:rgba(0,0,0,0.6)","padding:16px",
+    "overflow-y:auto","align-items:flex-start","justify-content:center",
+    "backdrop-filter:blur(2px)",
+  ].join(";");
+  overlay.onclick = e => { if (e.target === overlay) overlay.style.display = "none"; };
+
+  overlay.innerHTML = `
+    <div style="background:#fff;border-radius:14px;width:100%;max-width:480px;padding:20px;margin-top:12px;box-shadow:0 20px 60px rgba(0,0,0,.2)">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+        <span style="font-family:var(--mono);font-size:11px;font-weight:900;letter-spacing:.12em;color:#111">DELA &amp; EXPORTERA</span>
+        <button onclick="document.getElementById('_share-modal').style.display='none'"
+          style="background:none;border:1.5px solid #f87171;color:#f87171;border-radius:6px;width:34px;height:34px;cursor:pointer;font-size:14px;display:flex;align-items:center;justify-content:center">✕</button>
+      </div>
+
+      <div style="font-family:var(--mono);font-size:10px;color:var(--muted);letter-spacing:.06em;font-weight:700;margin-bottom:6px">DELA LÄNK</div>
+      <div id="_share-status" style="font-family:var(--mono);font-size:11px;color:var(--muted);margin-bottom:8px">Genererar länk…</div>
+
+      <div style="display:flex;gap:8px;margin-bottom:10px">
+        <input id="_share-url" readonly
+          style="flex:1;font-family:var(--mono);font-size:11px;border:1.5px solid var(--border);border-radius:6px;padding:9px 10px;background:#f8f6f2;color:var(--text);outline:none;min-width:0"
+          value="" />
+        <button id="_share-copy-btn" onclick="_copyShareUrl()"
+          style="font-family:var(--mono);font-size:12px;font-weight:800;background:#111;color:#fff;border:none;border-radius:6px;padding:0 16px;cursor:pointer;white-space:nowrap;min-height:38px">
+          Kopiera
+        </button>
+      </div>
+
+      <div style="display:flex;flex-direction:column;gap:6px;margin-bottom:16px">
+        <button onclick="_openQR()"
+          style="font-family:var(--mono);font-size:12px;font-weight:700;background:#f5f3ef;color:#333;border:1.5px solid var(--border2);border-radius:6px;padding:10px;cursor:pointer;text-align:left">
+          Visa QR-kod
+        </button>
+        <button onclick="_nativeShare()"
+          id="_native-share-btn"
+          style="font-family:var(--mono);font-size:12px;font-weight:700;background:#f5f3ef;color:#333;border:1.5px solid var(--border2);border-radius:6px;padding:10px;cursor:pointer;text-align:left;display:none">
+          Dela via…
+        </button>
+      </div>
+
+      <div id="_share-qr" style="display:none;margin-bottom:16px;text-align:center"></div>
+
+      <div style="height:1px;background:var(--border);margin-bottom:16px"></div>
+      <div style="font-family:var(--mono);font-size:10px;color:var(--muted);letter-spacing:.06em;font-weight:700;margin-bottom:8px">EXPORTERA BACKUP</div>
+      <button onclick="exportBackup();document.getElementById('_share-modal').style.display='none'"
+        style="font-family:var(--mono);font-size:12px;font-weight:700;background:#f5f3ef;color:#333;border:1.5px solid var(--border2);border-radius:6px;padding:10px;cursor:pointer;text-align:left;width:100%">
+        Ladda ner backup (.json)
+      </button>
+
+      <div style="margin-top:14px;padding:10px 12px;background:#fffbeb;border-radius:6px;border:1px solid #fcd34d">
+        <div style="font-family:var(--mono);font-size:10px;font-weight:800;color:#92400e;letter-spacing:.06em;margin-bottom:4px">NOTERA</div>
+        <div style="font-size:12px;color:#78350f;line-height:1.5">
+          Länken innehåller hela plocklistan inkl. kategoritilldelningar. Uppdatera länken igen efter ändringar.
+        </div>
+      </div>
+    </div>`;
+
+  document.body.appendChild(overlay);
+  return overlay;
+}
+
+let _shareUrl = "";
+
+function _openShareModal() { openShareModal(); }
+
+async function openShareModal() {
+  const modal = _buildShareModal();
+  modal.style.display = "flex";
+
+  const status = document.getElementById("_share-status");
+  const input  = document.getElementById("_share-url");
+  const native = document.getElementById("_native-share-btn");
+
+  if (navigator.share) native.style.display = "block";
+
+  try {
+    const encoded = await _encodeState();
+    const url = location.origin + location.pathname + "#share=" + encoded;
+    _shareUrl = url;
+    input.value = url;
+
+    const kb = (encoded.length * 3 / 4 / 1024).toFixed(1);
+    status.textContent = `Länk klar · ${kb} KB · ${state.articles.length} artiklar`;
+    status.style.color = "var(--ok)";
+  } catch (e) {
+    status.textContent = "Kunde inte generera länk: " + e.message;
+    status.style.color = "var(--err)";
+  }
+}
+
+function _copyShareUrl() {
+  if (!_shareUrl) return;
+  navigator.clipboard.writeText(_shareUrl).then(() => {
+    const btn = document.getElementById("_share-copy-btn");
+    const orig = btn.textContent;
+    btn.textContent = "✓ Kopierad!";
+    btn.style.background = "#14532d";
+    setTimeout(() => { btn.textContent = orig; btn.style.background = "#111"; }, 2000);
+  }).catch(() => {
+    const input = document.getElementById("_share-url");
+    input.select(); document.execCommand("copy");
+  });
+}
+
+function _nativeShare() {
+  if (!_shareUrl) return;
+  navigator.share({ title: "Plockflow", text: "Plocklista", url: _shareUrl }).catch(() => {});
+}
+
+function _openQR() {
+  const qrDiv = document.getElementById("_share-qr");
+  if (qrDiv.style.display === "block") { qrDiv.style.display = "none"; return; }
+  if (!_shareUrl) return;
+
+  // Use Google Charts QR API (works offline via cache, or show fallback)
+  const size = Math.min(window.innerWidth - 80, 280);
+  const encoded = encodeURIComponent(_shareUrl);
+  qrDiv.style.display = "block";
+  qrDiv.innerHTML = `
+    <img src="https://chart.googleapis.com/chart?cht=qr&chs=${size}x${size}&chl=${encoded}&choe=UTF-8"
+      style="border-radius:8px;border:4px solid #f0ede8;max-width:100%"
+      onerror="this.parentNode.innerHTML='<div style=\\'font-size:12px;color:var(--muted);padding:10px\\'>QR kräver internet</div>'" />
+    <div style="font-size:11px;font-family:var(--mono);color:var(--muted);margin-top:8px">Skanna för att öppna på annan enhet</div>`;
+}
+
+// ── Inject share button into topbar ─────────────────────────
+function _injectShareButton() {
+  // Share is now in the hamburger menu — no separate topbar button needed
+}
+
+// ── Load from hash on startup ─────────────────────────────────
+async function _loadFromHash() {
+  const hash = location.hash;
+  if (!hash.startsWith("#share=")) return false;
+  const encoded = hash.slice(7);
+  if (!encoded) return false;
+
+  const data = await _decodeState(encoded);
+  if (!data?.state?.articles) return false;
+
+  // Show a read-only banner
+  const banner = document.createElement("div");
+  banner.style.cssText = [
+    "background:#1e3a5f","color:#93c5fd","padding:10px 14px",
+    "font-family:var(--mono)","font-size:12px","font-weight:700",
+    "display:flex","align-items:center","justify-content:space-between",
+    "gap:10px","flex-wrap:wrap","margin-bottom:10px","border-radius:6px",
+  ].join(";");
+  banner.innerHTML = `
+    <span>Delad plocklista — ${data.state.articles.length} artiklar · ${data.deliveryDate || "inget datum"}</span>
+    <button onclick="_importSharedState()" style="background:#2563eb;color:#fff;border:none;border-radius:5px;padding:6px 14px;font-family:var(--mono);font-size:11px;font-weight:700;cursor:pointer">
+      Importera till min lista
+    </button>`;
+
+  window._sharedData = data;
+
+  // Apply the shared state visually (read-only preview)
+  state = Object.assign(
+    { articles:[], checked:{}, kommentarer:{}, deliveryOrder:[], weights:{} },
+    data.state
+  );
+  window._kundMap = data.kundMap || {};
+  if (data.catMap) window._catMap = data.catMap;
+  if (data.deliveryDate) deliveryDate = data.deliveryDate;
+
+  // Don't persist — this is just a preview
+  render();
+
+  // Insert banner before plocklista
+  const main = document.getElementById("main");
+  const plocklista = document.getElementById("plocklista");
+  if (main && plocklista) main.insertBefore(banner, plocklista);
+
+  return true;
+}
+
+function _importSharedState() {
+  if (!window._sharedData) return;
+  const data = window._sharedData;
+  state = Object.assign(
+    { articles:[], checked:{}, kommentarer:{}, deliveryOrder:[], weights:{} },
+    data.state
+  );
+  window._kundMap = data.kundMap || {};
+  if (data.catMap) { window._catMap = data.catMap; localStorage.setItem(SK_CATMAP, JSON.stringify(data.catMap)); }
+  if (data.deliveryDate) deliveryDate = data.deliveryDate;
+  persistState(); persistDate();
+  // Remove hash and banner
+  history.replaceState(null, "", location.pathname);
+  const banner = document.querySelector("[data-share-banner]");
+  if (banner) banner.remove();
+  render();
+  showMessages([{ type:"ok", text:`Importerad: ${state.articles.length} artiklar` }]);
+  window._sharedData = null;
+  // Remove the banner (find by content)
+  document.querySelectorAll("#main > div").forEach(el => {
+    if (el.style.background === "rgb(30, 58, 95)") el.remove();
+  });
+}
+
+// Patch persistState to also update share button visibility
+const _origPersist = persistState;
+persistState = function() {
+  _origPersist.call(this);
+  _injectShareButton(); // ensure button visible after first import
+};
+
+// ── Init ──────────────────────────────────────────────────────
+(async function shareInit() {
+  const loadedFromHash = await _loadFromHash();
+  if (!loadedFromHash) {
+    _injectShareButton();
+  }
+})();
+
+</script>
+
+<!-- ── KATEGORI-KONFIGURATION ───────────────────────────────── -->
+<div id="cat-order-modal" onclick="if(event.target===this)closeCatOrderModal()">
+  <div id="cat-order-sheet">
+    <div id="cat-order-drag-handle"></div>
+    <div id="cat-order-sheet-header">
+      <span id="cat-order-sheet-title">KATEGORIER</span>
+      <button id="cat-order-sheet-close" onclick="closeCatOrderModal()">✕</button>
+    </div>
+    <div id="cat-order-sheet-body">
+      <!-- Artikellista -->
+      <div class="cos-section-label" style="margin-top:4px">ARTIKLAR — tryck för att byta kategori</div>
+      <div id="_cm-artlist"></div>
+      <!-- Sorteringsordning -->
+      <div class="cos-section-label">SORTERINGSORDNING — håll &amp; dra</div>
+      <div id="cat-order-list"></div>
+      <div style="height:8px"></div>
+    </div>
+    <div id="cat-order-sheet-footer">
+      <button class="ibtn ibtn-p" onclick="saveCatOrder()">Spara &amp; stäng</button>
+      <button class="ibtn ibtn-s" onclick="resetCatOrder()">Återställ</button>
+    </div>
+  </div>
+</div>
+
+<!-- Floating cat picker popup -->
+<div id="_cat-picker-popup" class="cat-picker-popup"></div>
+
+<!-- ══════════════════════════════════════════════════════════════
+     LASTSÄKRING — fristående tillägg
+     Räknar på om lastväggen (E-track + lås + golvöglor) håller för
+     vikten i dagens körning. Vikt hämtas automatiskt från Vikter
+     per kund + manuellt tillagt/bildavläst gods.
+     ══════════════════════════════════════════════════════════════ -->
+<style>
+.ls-section-label { font-family: var(--mono); font-size: 10px; font-weight: 800; letter-spacing: .1em; color: var(--muted); text-transform: uppercase; margin: 14px 0 6px; }
+.ls-section-label:first-child { margin-top: 0; }
+.ls-banner { border-radius: 10px; padding: 14px 16px; margin-bottom: 4px; }
+.ls-banner-ok  { background: var(--ok-bg);  border: 1.5px solid #4ade80; }
+.ls-banner-err { background: var(--err-bg); border: 1.5px solid #f87171; }
+.ls-banner-title { font-family: var(--mono); font-size: 13px; font-weight: 900; letter-spacing: .03em; margin-bottom: 8px; }
+.ls-banner-ok .ls-banner-title  { color: var(--ok); }
+.ls-banner-err .ls-banner-title { color: var(--err); }
+.ls-banner-row { display: flex; justify-content: space-between; gap: 10px; font-size: 12.5px; padding: 4px 0; border-bottom: 1px dashed rgba(0,0,0,.1); }
+.ls-banner-row:last-child { border-bottom: none; }
+.ls-banner-row b { font-family: var(--mono); white-space: nowrap; }
+.ls-banner-warn { font-size: 11.5px; font-weight: 700; color: var(--err); padding-top: 6px; }
+.ls-bottleneck { font-size: 11px; color: var(--muted); margin-top: 6px; }
+.ls-row { display: flex; align-items: center; gap: 8px; padding: 7px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+.ls-row:last-child { border-bottom: none; }
+.ls-row-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+.ls-row-kg { font-family: var(--mono); font-weight: 800; white-space: nowrap; }
+.ls-row-del { background: none; border: none; color: var(--err); font-size: 16px; cursor: pointer; padding: 2px 8px; line-height: 1; }
+.ls-add-row { display: flex; gap: 6px; margin-top: 8px; }
+.ls-add-row input { font-family: var(--mono); font-size: 13px; border: 1px solid var(--border2); border-radius: 6px; padding: 8px; outline: none; background: #f8f6f2; color: var(--text); }
+.ls-add-row input.ls-kg { width: 78px; text-align: right; }
+.ls-add-row input.ls-label { flex: 1; min-width: 0; }
+.ls-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.ls-chip { font-family: var(--mono); font-size: 13px; font-weight: 700; background: #eff6ff; color: #2563eb; border: 1.5px solid #bfdbfe; border-radius: 20px; padding: 7px 14px; cursor: pointer; }
+.ls-chip:active { background: #dbeafe; }
+.ls-settings-grid { display: grid; grid-template-columns: 1fr 92px; gap: 9px 10px; align-items: center; margin-top: 8px; }
+.ls-settings-grid label { font-size: 12px; color: var(--text); }
+.ls-settings-grid input { font-family: var(--mono); font-size: 13px; text-align: right; border: 1px solid var(--border2); border-radius: 6px; padding: 6px 8px; outline: none; background: #f8f6f2; color: var(--text); }
+.ls-hint { grid-column: 1 / -1; font-size: 10.5px; color: var(--muted); margin: -3px 0 5px; line-height: 1.45; }
+.ls-toggle-settings { background: none; border: none; color: #2563eb; font-family: var(--mono); font-size: 11px; font-weight: 700; cursor: pointer; padding: 4px 0; }
+</style>
+
+<div id="lastsakring-modal" class="modal-overlay" onclick="if(event.target===this)closeLastsakringModal()">
+  <div class="modal-box" style="max-width:600px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <span style="font-family:var(--mono);font-size:12px;font-weight:700;letter-spacing:0.1em">LASTSÄKRING — KLARAR VÄGGEN LASTEN?</span>
+      <button class="tbtn tbtn-r" onclick="closeLastsakringModal()" style="font-size:12px;padding:4px 10px">✕</button>
+    </div>
+
+    <div id="ls-banner"></div>
+
+    <div class="ls-section-label">VIKT FRÅN PLOCKLISTA</div>
+    <div id="ls-plocklista-vikt" style="font-family:var(--mono);font-size:13px;color:var(--muted)"></div>
+
+    <div class="ls-section-label">EXTRA GODS (ej i plocklistan)</div>
+    <div id="ls-extra-list"></div>
+    <div class="ls-add-row">
+      <input type="text" id="ls-add-label" class="ls-label" placeholder="Vad (valfritt)">
+      <input type="number" id="ls-add-kg" class="ls-kg" placeholder="kg" inputmode="decimal">
+      <button class="ibtn ibtn-p" style="padding:8px 14px" onclick="lsAddManual()">Lägg till</button>
+    </div>
+    <div style="margin-top:10px">
+      <button class="ibtn ibtn-s" onclick="document.getElementById('ls-img-input').click()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:14px;height:14px;vertical-align:-2px;margin-right:5px"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
+        Läs av vikt från bild
+      </button>
+      <input type="file" id="ls-img-input" accept="image/*" capture="environment" style="display:none" onchange="lsHandleImage(event)">
+    </div>
+    <div id="ls-ocr-status" style="display:none;font-family:var(--mono);font-size:11px;color:var(--muted);margin-top:7px"></div>
+    <div id="ls-ocr-chips" class="ls-chips"></div>
+
+    <button class="ls-toggle-settings" onclick="lsToggleSettings()" id="ls-settings-toggle" style="margin-top:16px">Visa inställningar (väggens hållkraft) ▾</button>
+    <div id="ls-settings-body" style="display:none">
+      <div class="ls-settings-grid">
+        <label>Antal låspunkter i skenan</label><input type="number" id="ls-s-lockPoints">
+        <label>Kraft per låspunkt (kg)</label><input type="number" id="ls-s-forcePerLock">
+        <div class="ls-hint">Hämta från databladet för det E-track-lås/bult du faktiskt monterar — gissa inte.</div>
+        <label>Golvöglor som används</label><input type="number" id="ls-s-floorLoops">
+        <label>Märklast per golvögla (kg)</label><input type="number" id="ls-s-floorLoopRating">
+        <div class="ls-hint">Står ofta vid öglan eller i instruktionsboken för din Iveco Daily-variant.</div>
+        <label>Säkerhetsfaktor</label><input type="number" id="ls-s-safetyFactor" step="0.1">
+        <label>g-faktor framåt</label><input type="number" id="ls-s-gForward" step="0.1">
+        <div class="ls-hint">0,8 är standardvärdet vid inbromsning för skåpbil &lt; 3,5 ton enligt ISO 27956 / VDI 2700.</div>
+        <label>Max nyttolast fordon, kg (valfritt)</label><input type="number" id="ls-s-maxPayload">
+      </div>
+      <button class="ibtn ibtn-s" style="margin-top:10px" onclick="lsSaveSettings()">Spara inställningar</button>
+    </div>
+
+    <div style="margin-top:16px;display:flex;gap:8px;flex-wrap:wrap">
+      <button class="ibtn ibtn-p" id="ls-copy-btn" onclick="lsCopySummary()">Kopiera sammanfattning</button>
+      <button class="ibtn ibtn-s" onclick="lsClearExtra()">Rensa extra gods</button>
+      <button class="ibtn ibtn-s" onclick="closeLastsakringModal()">Stäng</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const SK_LASTSAKRING = "plockflow_lastsakring_v1";
+const TESSERACT_URL  = "https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js";
+
+const LS_DEFAULTS = {
+  lockPoints: 4,
+  forcePerLock: 300,
+  floorLoops: 4,
+  floorLoopRating: 400,
+  safetyFactor: 1.5,
+  gForward: 0.8,
+  maxPayload: null,
+};
+
+let lsData = { settings: Object.assign({}, LS_DEFAULTS), extra: [] };
+
+function lsLoad() {
+  try {
+    const raw = localStorage.getItem(SK_LASTSAKRING);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      lsData.settings = Object.assign({}, LS_DEFAULTS, parsed.settings || {});
+      lsData.extra = Array.isArray(parsed.extra) ? parsed.extra : [];
+    }
+  } catch (e) {}
+}
+function lsPersist() {
+  try { localStorage.setItem(SK_LASTSAKRING, JSON.stringify(lsData)); } catch (e) {}
+}
+
+function lsPlocklistaWeight() {
+  const ws = (typeof state !== "undefined" && state.weights) || {};
+  return Object.values(ws).reduce((s, w) => s + (typeof w === "number" ? w : 0), 0);
+}
+function lsExtraWeight() { return lsData.extra.reduce((s, e) => s + (e.kg || 0), 0); }
+function lsTotalWeight() { return lsPlocklistaWeight() + lsExtraWeight(); }
+
+function lsCalc() {
+  const s = lsData.settings;
+  const total = lsTotalWeight();
+  const required = total * s.gForward;
+  const capLocks = (s.lockPoints * s.forcePerLock) / s.safetyFactor;
+  const capLoops = (s.floorLoops * s.floorLoopRating) / s.safetyFactor;
+  const capacity = Math.min(capLocks, capLoops);
+  const margin = capacity - required;
+  const pass = margin >= 0;
+  const bottleneck = capLocks <= capLoops ? "låspunkterna i skenan" : "golvöglorna";
+  const maxSafeLoad = s.gForward > 0 ? capacity / s.gForward : 0;
+  const overPayload = !!(s.maxPayload && total > s.maxPayload);
+  return { total, required, capLocks, capLoops, capacity, margin, pass, bottleneck, maxSafeLoad, overPayload };
+}
+
+const lsFmtKg = n => Math.round(n).toLocaleString("sv-SE") + " kg";
+
+function lsRenderBanner() {
+  const c = lsCalc();
+  const s = lsData.settings;
+  const el = document.getElementById("ls-banner");
+  if (!el) return;
+  const cls = c.pass ? "ls-banner-ok" : "ls-banner-err";
+  const title = c.pass
+    ? "KLARAR LASTEN — marginal " + lsFmtKg(c.margin)
+    : "KLARAR INTE LASTEN — " + lsFmtKg(-c.margin) + " för mycket";
+  el.innerHTML =
+    '<div class="ls-banner ' + cls + '">' +
+      '<div class="ls-banner-title">' + title + '</div>' +
+      '<div class="ls-banner-row"><span>Total vikt bakom väggen</span><b>' + lsFmtKg(c.total) + '</b></div>' +
+      '<div class="ls-banner-row"><span>Erforderlig hållkraft (' + s.gForward + 'g framåt)</span><b>' + lsFmtKg(c.required) + '</b></div>' +
+      '<div class="ls-banner-row"><span>Tillgänglig kapacitet (säkerhetsfaktor ' + s.safetyFactor + ')</span><b>' + lsFmtKg(c.capacity) + '</b></div>' +
+      '<div class="ls-banner-row"><span>Max säker last m. nuvarande montering</span><b>' + lsFmtKg(c.maxSafeLoad) + '</b></div>' +
+      (c.overPayload ? '<div class="ls-banner-warn">VARNING: överstiger angiven max nyttolast (' + lsFmtKg(s.maxPayload) + ')</div>' : '') +
+      '<div class="ls-bottleneck">Begränsande faktor just nu: ' + c.bottleneck + '</div>' +
+    '</div>';
+}
+
+function lsRenderExtraList() {
+  const el = document.getElementById("ls-extra-list");
+  if (!el) return;
+  if (!lsData.extra.length) {
+    el.innerHTML = '<div style="font-size:12px;color:var(--muted);font-family:var(--mono)">Inget extra gods inlagt.</div>';
+    return;
+  }
+  el.innerHTML = lsData.extra.map(e =>
+    '<div class="ls-row">' +
+      '<span class="ls-row-label">' + escHtml(e.label || "Gods") + '</span>' +
+      '<span class="ls-row-kg">' + lsFmtKg(e.kg) + '</span>' +
+      '<button class="ls-row-del" onclick="lsRemoveExtra(\'' + e.id + '\')">✕</button>' +
+    '</div>'
+  ).join("");
+}
+
+function lsRenderPlocklistaWeight() {
+  const el = document.getElementById("ls-plocklista-vikt");
+  if (!el) return;
+  const w = lsPlocklistaWeight();
+  el.textContent = w ? (lsFmtKg(w) + " (summerat från Vikter per kund)") : "Inga vikter inlagda i plocklistan ännu.";
+}
+
+function lsRenderAll() {
+  lsRenderBanner();
+  lsRenderExtraList();
+  lsRenderPlocklistaWeight();
+}
+
+function lsAddManual() {
+  const labelEl = document.getElementById("ls-add-label");
+  const kgEl = document.getElementById("ls-add-kg");
+  const kg = parseFloat((kgEl.value || "").replace(",", "."));
+  if (!kg || kg <= 0) { kgEl.focus(); return; }
+  lsData.extra.push({ id: "ls" + Date.now() + Math.random().toString(36).slice(2,6), label: labelEl.value.trim(), kg: kg });
+  lsPersist();
+  labelEl.value = ""; kgEl.value = "";
+  lsRenderAll();
+}
+
+function lsRemoveExtra(id) {
+  lsData.extra = lsData.extra.filter(e => e.id !== id);
+  lsPersist();
+  lsRenderAll();
+}
+
+function lsClearExtra() {
+  if (!lsData.extra.length) return;
+  if (!confirm("Rensa allt extra gods?")) return;
+  lsData.extra = [];
+  lsPersist();
+  lsRenderAll();
+}
+
+function lsToggleSettings() {
+  const body = document.getElementById("ls-settings-body");
+  const btn = document.getElementById("ls-settings-toggle");
+  const isOpen = body.style.display !== "none";
+  body.style.display = isOpen ? "none" : "block";
+  btn.textContent = isOpen ? "Visa inställningar (väggens hållkraft) ▾" : "Dölj inställningar ▴";
+  if (!isOpen) lsFillSettingsForm();
+}
+function lsFillSettingsForm() {
+  const s = lsData.settings;
+  document.getElementById("ls-s-lockPoints").value = s.lockPoints;
+  document.getElementById("ls-s-forcePerLock").value = s.forcePerLock;
+  document.getElementById("ls-s-floorLoops").value = s.floorLoops;
+  document.getElementById("ls-s-floorLoopRating").value = s.floorLoopRating;
+  document.getElementById("ls-s-safetyFactor").value = s.safetyFactor;
+  document.getElementById("ls-s-gForward").value = s.gForward;
+  document.getElementById("ls-s-maxPayload").value = s.maxPayload || "";
+}
+function lsSaveSettings() {
+  const num = (id, fallback) => { const v = parseFloat(document.getElementById(id).value); return (isFinite(v) && v > 0) ? v : fallback; };
+  lsData.settings.lockPoints      = num("ls-s-lockPoints", LS_DEFAULTS.lockPoints);
+  lsData.settings.forcePerLock    = num("ls-s-forcePerLock", LS_DEFAULTS.forcePerLock);
+  lsData.settings.floorLoops      = num("ls-s-floorLoops", LS_DEFAULTS.floorLoops);
+  lsData.settings.floorLoopRating = num("ls-s-floorLoopRating", LS_DEFAULTS.floorLoopRating);
+  lsData.settings.safetyFactor    = num("ls-s-safetyFactor", LS_DEFAULTS.safetyFactor);
+  lsData.settings.gForward        = num("ls-s-gForward", LS_DEFAULTS.gForward);
+  const mp = parseFloat(document.getElementById("ls-s-maxPayload").value);
+  lsData.settings.maxPayload = (isFinite(mp) && mp > 0) ? mp : null;
+  lsPersist();
+  lsRenderAll();
+}
+
+function openLastsakringModal() {
+  lsRenderAll();
+  document.getElementById("lastsakring-modal").classList.add("open");
+}
+function closeLastsakringModal() {
+  document.getElementById("lastsakring-modal").classList.remove("open");
+  const chips = document.getElementById("ls-ocr-chips"); if (chips) chips.innerHTML = "";
+  const st = document.getElementById("ls-ocr-status"); if (st) st.style.display = "none";
+}
+
+// ── Bildimport via OCR (Tesseract.js, laddas från jsdelivr vid behov) ──
+let _tessWorker = null;
+async function _lsLoadTesseractScript() {
+  if (window.Tesseract) return window.Tesseract;
+  await new Promise((res, rej) => {
+    const s = document.createElement("script");
+    s.src = TESSERACT_URL;
+    s.onload = res;
+    s.onerror = () => rej(new Error("kunde inte ladda OCR-biblioteket (kräver internet första gången)"));
+    document.head.appendChild(s);
+  });
+  return window.Tesseract;
+}
+async function _lsGetWorker() {
+  if (_tessWorker) return _tessWorker;
+  const Tesseract = await _lsLoadTesseractScript();
+  _tessWorker = await Tesseract.createWorker("eng");
+  await _tessWorker.setParameters({ tessedit_char_whitelist: "0123456789.,kgKG " });
+  return _tessWorker;
+}
+
+async function lsHandleImage(ev) {
+  const file = ev.target.files[0];
+  ev.target.value = "";
+  if (!file) return;
+  const statusEl = document.getElementById("ls-ocr-status");
+  const chipsEl  = document.getElementById("ls-ocr-chips");
+  chipsEl.innerHTML = "";
+  statusEl.style.display = "block";
+  statusEl.textContent = "Läser av bild… (första gången krävs internet för OCR-motorn, ca någon sekund/MB)";
+  try {
+    const worker = await _lsGetWorker();
+    const { data } = await worker.recognize(file);
+    const text = (data && data.text) || "";
+    const matches = [...text.matchAll(/\d+(?:[.,]\d+)?/g)]
+      .map(m => parseFloat(m[0].replace(",", ".")))
+      .filter(n => n > 0 && n < 100000);
+    const unique = [...new Set(matches)];
+    if (!unique.length) {
+      statusEl.textContent = "Hittade inga tal i bilden. Fyll i vikten manuellt istället.";
+      return;
+    }
+    statusEl.textContent = "Tryck på rätt vikt (kontrollera mot bilden innan du lägger till):";
+    chipsEl.innerHTML = unique.map(n =>
+      '<button type="button" class="ls-chip" onclick="lsConfirmOcr(' + n + ')">' +
+      (n % 1 === 0 ? n : n.toFixed(1).replace(".", ",")) + ' kg</button>'
+    ).join("");
+  } catch (e) {
+    statusEl.textContent = "Kunde inte tolka bilden: " + e.message;
+  }
+}
+function lsConfirmOcr(kg) {
+  lsData.extra.push({ id: "ls" + Date.now() + Math.random().toString(36).slice(2,6), label: "Från bild", kg: kg });
+  lsPersist();
+  document.getElementById("ls-ocr-status").style.display = "none";
+  document.getElementById("ls-ocr-chips").innerHTML = "";
+  lsRenderAll();
+}
+
+function lsCopySummary() {
+  const c = lsCalc();
+  const s = lsData.settings;
+  let txt = "LASTSÄKRING — SAMMANFATTNING\n";
+  txt += "Datum: " + ((typeof deliveryDate !== "undefined" && deliveryDate) || todayISO()) + "\n\n";
+  txt += "Vikt från plocklista: " + lsFmtKg(lsPlocklistaWeight()) + "\n";
+  if (lsData.extra.length) {
+    txt += "Extra gods:\n";
+    lsData.extra.forEach(e => { txt += "  " + (e.label || "Gods") + " — " + lsFmtKg(e.kg) + "\n"; });
+  }
+  txt += "\nTotal vikt: " + lsFmtKg(c.total) + "\n";
+  txt += "Erforderlig hållkraft (" + s.gForward + "g framåt, ISO 27956/VDI 2700): " + lsFmtKg(c.required) + "\n";
+  txt += "Tillgänglig kapacitet (säkerhetsfaktor " + s.safetyFactor + "): " + lsFmtKg(c.capacity) + "\n";
+  txt += "  – Låspunkter: " + s.lockPoints + " × " + s.forcePerLock + " kg\n";
+  txt += "  – Golvöglor: " + s.floorLoops + " × " + s.floorLoopRating + " kg\n";
+  txt += "Resultat: " + (c.pass ? "KLARAR LASTEN" : "KLARAR INTE LASTEN") + " (marginal " + lsFmtKg(c.margin) + ")\n";
+  txt += "Max säker last med nuvarande montering: " + lsFmtKg(c.maxSafeLoad) + "\n";
+
+  navigator.clipboard.writeText(txt).then(() => {
+    const btn = document.getElementById("ls-copy-btn");
+    const orig = btn.textContent;
+    btn.textContent = "✓ Kopierad!";
+    setTimeout(() => { btn.textContent = orig; }, 2000);
+  }).catch(() => { alert(txt); });
+}
+
+// ── Init: ladda sparade inställningar, visa menyknapp & hamburgermeny alltid ──
+lsLoad();
+(function () {
+  const hb = document.getElementById("btn-hamburger");
+  if (hb) hb.style.display = "";
+  if (typeof render === "function") {
+    const _origRenderForLS = render;
+    render = function () {
+      _origRenderForLS.apply(this, arguments);
+      const el = document.getElementById("btn-hamburger");
+      if (el) el.style.display = "";
+    };
+  }
+})();
+(function () {
+  const body = document.getElementById("hm-body");
+  if (!body || document.getElementById("hm-lastsakring")) return;
+  const sep = document.createElement("div"); sep.className = "hm-sep";
+  const sec = document.createElement("div"); sec.className = "hm-section"; sec.textContent = "SÄKERHET";
+  const btn = document.createElement("button");
+  btn.className = "hm-item"; btn.id = "hm-lastsakring"; btn.type = "button";
+  btn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 3 6v6c0 5 4 9 9 10 5-1 9-5 9-10V6z"/><path d="M9 12l2 2 4-4"/></svg> Lastsäkring';
+  btn.onclick = function () { closeHamburger(); openLastsakringModal(); };
+  body.appendChild(sep); body.appendChild(sec); body.appendChild(btn);
+})();
+</script>
+
+</body>
+</html>
